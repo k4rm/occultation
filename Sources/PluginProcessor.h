@@ -44,6 +44,14 @@ public:
     static constexpr int skyMapSourceId = 997;
     static constexpr int customPathSourceId = 999;
 
+    // Bundled sample astrophotographs, offered straight from the Source menu.
+    // Their sourceIds run from firstSampleImageSourceId upwards, in the order
+    // sampleImages() lists them - picked well clear of the camera indices
+    // (2-4) and of the 997/999/1000/1001 specials.
+    static constexpr int firstSampleImageSourceId = 900;
+    struct SampleImage { const char* label; const char* data; int size; };
+    static const std::vector<SampleImage>& sampleImages();
+
     VisionMidiProcessor();
     ~VisionMidiProcessor() override;
 

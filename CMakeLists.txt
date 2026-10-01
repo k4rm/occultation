@@ -202,6 +202,17 @@ juce_add_binary_data(OccultationAssets
         Resources/celestial/uranus.png
         Resources/celestial/neptune.png
         Resources/celestial/pluto.png
+        # Sample astrophotographs, offered directly in the Source menu so the
+        # plugin has something worth listening to the moment it loads - no
+        # hunting for a file first. Compiled in rather than installed beside
+        # the bundle because images/ exists only in this source tree; on a
+        # user's machine there is no path to point at.
+        images/M8_Balitung_2026-08-17.jpg
+        images/M20_Belitung_2026-08-16.jpg
+        images/M33_2026-09-26.jpg
+        images/M_17_Balitung_2026-08_16_postpro_og_Duo-Band.png
+        images/IC1848_Belitung_2026-09-06.jpg
+        images/NGC_281_Pacman_2026-09-04.jpg
 )
 
 # 3. Define the JUCE VST3 instrument plugin target — was a pure MIDI-effect

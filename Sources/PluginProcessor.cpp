@@ -59,9 +59,8 @@ CelestialAsset moonPhaseAsset (int phaseIndex)
 // there's no reason to keep two decoders around: JUCE's has to be linked in
 // regardless, reads jpg/png/gif, and takes file access out of OpenCV's hands
 // entirely (which also side-steps non-ASCII path handling).
-static cv::Mat loadImageFileAsMat (const juce::File& file)
+static cv::Mat juceImageToBgrMat (juce::Image img)
 {
-    juce::Image img = juce::ImageFileFormat::loadFrom (file);
     if (! img.isValid()) return {};
 
     img = img.convertedToFormat (juce::Image::ARGB);
@@ -78,6 +77,22 @@ static cv::Mat loadImageFileAsMat (const juce::File& file)
         }
     }
     return bgr;
+}
+
+static cv::Mat loadImageFileAsMat (const juce::File& file)
+{
+    return juceImageToBgrMat (juce::ImageFileFormat::loadFrom (file));
+}
+
+// The compiled-in sample astrophotographs (see juce_add_binary_data in
+// CMakeLists) go through JUCE's decoder too, for exactly the reason given
+// above: cv::imdecode hands back an empty Mat for every JPEG in this binary,
+// and five of the six samples are JPEGs. decodeRGBA() below is PNG-only
+// (celestial overlays) and can keep using cv::imdecode safely.
+static cv::Mat loadImageDataAsMat (const void* data, int size)
+{
+    if (data == nullptr || size <= 0) return {};
+    return juceImageToBgrMat (juce::ImageFileFormat::loadFrom (data, (size_t) size));
 }
 
 cv::Mat decodeRGBA (const CelestialAsset& asset)
@@ -236,6 +251,25 @@ void compositeRGBAOnto (cv::Mat& dest, const cv::Mat& rgba, cv::Point centre)
 }
 
 } // namespace
+
+// Bundled sample images, in menu order. Listed here rather than in the editor
+// so the processor can resolve a saved sourceId back to its image on reload
+// without the editor existing yet (a host restores state before opening any
+// window). Labels are what the Source menu shows; the catalogue designations
+// are the point, so they read as "M 8" rather than as a filename.
+const std::vector<VisionMidiProcessor::SampleImage>& VisionMidiProcessor::sampleImages()
+{
+    static const std::vector<SampleImage> samples {
+        { "M 8 - Lagoon",      BinaryData::M8_Balitung_20260817_jpg,       BinaryData::M8_Balitung_20260817_jpgSize },
+        { "M 17 - Omega",      BinaryData::M_17_Balitung_202608_16_postpro_og_DuoBand_png,
+                               BinaryData::M_17_Balitung_202608_16_postpro_og_DuoBand_pngSize },
+        { "M 20 - Trifid",     BinaryData::M20_Belitung_20260816_jpg,      BinaryData::M20_Belitung_20260816_jpgSize },
+        { "M 33 - Triangulum", BinaryData::M33_20260926_jpg,               BinaryData::M33_20260926_jpgSize },
+        { "IC 1848 - Soul",    BinaryData::IC1848_Belitung_20260906_jpg,   BinaryData::IC1848_Belitung_20260906_jpgSize },
+        { "NGC 281 - Pacman",  BinaryData::NGC_281_Pacman_20260904_jpg,    BinaryData::NGC_281_Pacman_20260904_jpgSize },
+    };
+    return samples;
+}
 
 //==============================================================================
 // Minimal FITS reader for DWARF mini raw/stacked captures — no external FITS
@@ -1647,7 +1681,21 @@ void VisionMidiProcessor::switchSource (int sourceId) {
     viewCenterY.store (0.5f);
     viewRotationDegrees.store (0.0f);
 
-    if (sourceId == 997) {
+    const auto& samples = sampleImages();
+    const int sampleIndex = sourceId - firstSampleImageSourceId;
+    if (sampleIndex >= 0 && sampleIndex < (int) samples.size()) {
+        // A compiled-in sample: decoded straight from the binary, so there is
+        // no file to find and nothing to go missing on a user's machine. Goes
+        // down the same isStaticImage path a loaded .jpg/.png takes, so zoom,
+        // the sequencer and Invader mode all behave identically.
+        const auto& sample = samples[(size_t) sampleIndex];
+        staticImageFrame = loadImageDataAsMat (sample.data, sample.size);
+        if (! staticImageFrame.empty()) {
+            isStaticImage = true;
+            activeSourceId = sourceId;
+            activeFilePath = "";
+        }
+    } else if (sourceId == 997) {
         // Sky map mode — no capture device needed. Star-based MIDI sampling
         // (findBrightestStar/findStarsInStrip) never touches detectionThreshold,
         // so it would otherwise sit frozen at whatever a previous camera/file

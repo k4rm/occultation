@@ -1245,6 +1245,17 @@ void VisionMidiEditor::updateAvailableSources() {
                                           : ("File: " + juce::File (customPath).getFileName());
         cameraSelector.addItem (label, 999);
     }
+    // Bundled sample astrophotographs - something worth listening to on first
+    // load, without hunting for a file first. Their own section, above Sky Map
+    // and the file/stream pickers.
+    cameraSelector.addSeparator();
+    {
+        const auto& samples = VisionMidiProcessor::sampleImages();
+        for (int i = 0; i < (int) samples.size(); ++i)
+            cameraSelector.addItem (samples[(size_t) i].label,
+                                    VisionMidiProcessor::firstSampleImageSourceId + i);
+    }
+
     cameraSelector.addSeparator();
     cameraSelector.addItem ("Sky Map", 997);
     cameraSelector.addItem ("Open File...", 1000);

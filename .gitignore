@@ -15,3 +15,10 @@ compile_commands.json
 # blanket *.png would drop them from a fresh clone and leave the README with
 # broken images.
 !docs/**/*.png
+
+# images/ are build inputs, not scratch captures: the sample astrophotographs
+# compiled in via juce_add_binary_data and offered straight from the Source
+# menu. Same reasoning as Resources/ above - the blanket *.jpg/*.png would
+# drop them from a fresh clone and break the build outright.
+!images/*.jpg
+!images/*.png
