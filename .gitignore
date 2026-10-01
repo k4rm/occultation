@@ -1,0 +1,12 @@
+build/
+compile_commands.json
+.DS_Store
+*.jpg
+*.png
+
+# Resources/ holds real build inputs, not scratch captures: the celestial
+# overlay images compiled in via juce_add_binary_data, and the bundle icon
+# CMake feeds to juce_add_plugin. The blanket *.png above would otherwise
+# leave them out of a fresh clone and break the build.
+!Resources/**/*.png
+!Resources/**/*.svg

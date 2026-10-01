@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  body { font: 13px -apple-system, "Helvetica Neue", sans-serif; margin: 0; color: #1d1d1f; }
+  h2 { font-size: 15px; margin: 0 0 8px; }
+  p { margin: 0 0 10px; line-height: 1.45; }
+  ul { margin: 0 0 10px; padding-left: 18px; }
+  li { margin-bottom: 4px; line-height: 1.4; }
+  code { font: 11px ui-monospace, Menlo, monospace; background: #f0f0f2; padding: 1px 3px; border-radius: 3px; }
+</style>
+</head>
+<body>
+
+<h2>Occultation</h2>
+
+<p>An audio plugin that turns light into sound — it watches an image source
+(camera, video file, network stream, FITS astrophotography stack, or a
+procedural star chart) and converts brightness into notes in real time.</p>
+
+<p>This installer places:</p>
+
+<ul>
+  <li><b>VST3</b> → <code>/Library/Audio/Plug-Ins/VST3</code></li>
+  <li><b>Audio Unit</b> → <code>/Library/Audio/Plug-Ins/Components</code></li>
+  <li><b>Standalone app</b> → <code>/Applications</code></li>
+</ul>
+
+<p>Click <b>Customize</b> on the install step to choose a subset. Everything
+needed at runtime (OpenCV, FFmpeg) ships inside the bundles, so there is
+nothing else to install.</p>
+
+<p>Occultation is an instrument that also emits MIDI: in a host, wire up both
+its MIDI input and its MIDI output to get notes back out of it.</p>
+
+</body>
+</html>

@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  productbuild distribution definition for the Occultation installer.
+
+  Placeholders (@VERSION@, @MIN_OS@, @HOST_ARCHS@) are substituted by
+  packaging/build_installer.sh, which reads the last two straight out of the
+  built Mach-O rather than hardcoding them: the pkg then refuses to install on
+  a machine the plugin could not actually run on, and keeps telling the truth
+  if CMAKE_OSX_DEPLOYMENT_TARGET / CMAKE_OSX_ARCHITECTURES change later.
+-->
+<installer-gui-script minSpecVersion="2">
+    <title>Occultation @VERSION@</title>
+    <organization>com.apokrypsi</organization>
+
+    <!-- customize="allow" keeps the plain Install button as the default path
+         while still offering a Customize pane, so someone who only wants the
+         AU (or only the standalone app) can deselect the rest. -->
+    <options customize="allow" require-scripts="false" hostArchitectures="@HOST_ARCHS@"/>
+
+    <!-- System domain only. Plug-in folders under ~/Library are per-user and
+         productbuild can target them via enable_currentUserHome, but that
+         roots the *whole* payload at the home directory — including the
+         standalone app, which belongs in /Applications — and Apple's
+         home-directory installs remain the buggier path. /Library/Audio/
+         Plug-Ins is scanned by every host for every user on the machine, at
+         the cost of one admin prompt, which is what commercial plug-in
+         installers do. -->
+    <domains enable_anywhere="false" enable_currentUserHome="false" enable_localSystem="true"/>
+
+    <allowed-os-versions>
+        <os-version min="@MIN_OS@"/>
+    </allowed-os-versions>
+
+    <welcome file="welcome.html" mime-type="text/html"/>
+    <license file="LICENSE.txt" mime-type="text/plain"/>
+    <conclusion file="conclusion.html" mime-type="text/html"/>
+
+    <choices-outline>
+        <line choice="choice.vst3"/>
+        <line choice="choice.au"/>
+        <line choice="choice.app"/>
+    </choices-outline>
+
+    <choice id="choice.vst3" title="VST3 Plug-In"
+            description="Installs Occultation.vst3 into /Library/Audio/Plug-Ins/VST3, for Ableton Live, Bitwig, Reaper, Cubase and other VST3 hosts.">
+        <pkg-ref id="com.apokrypsi.occultation.vst3"/>
+    </choice>
+
+    <choice id="choice.au" title="Audio Unit"
+            description="Installs Occultation.component into /Library/Audio/Plug-Ins/Components, for Logic Pro, GarageBand and other AU hosts.">
+        <pkg-ref id="com.apokrypsi.occultation.au"/>
+    </choice>
+
+    <choice id="choice.app" title="Standalone Application"
+            description="Installs Occultation.app into /Applications, for running without a host (sends MIDI out over an IAC bus).">
+        <pkg-ref id="com.apokrypsi.occultation.app"/>
+    </choice>
+
+    <pkg-ref id="com.apokrypsi.occultation.vst3" version="@VERSION@" onConclusion="none">occultation-vst3.pkg</pkg-ref>
+    <pkg-ref id="com.apokrypsi.occultation.au"   version="@VERSION@" onConclusion="none">occultation-au.pkg</pkg-ref>
+    <pkg-ref id="com.apokrypsi.occultation.app"  version="@VERSION@" onConclusion="none">occultation-app.pkg</pkg-ref>
+</installer-gui-script>
