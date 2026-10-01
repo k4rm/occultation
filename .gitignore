@@ -10,3 +10,8 @@ compile_commands.json
 # leave them out of a fresh clone and break the build.
 !Resources/**/*.png
 !Resources/**/*.svg
+
+# docs/ holds the README's screenshots — same story as Resources/ above: the
+# blanket *.png would drop them from a fresh clone and leave the README with
+# broken images.
+!docs/**/*.png

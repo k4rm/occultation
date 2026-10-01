@@ -1,5 +1,7 @@
 # Occultation
 
+![The Occultation plugin running in a host: a stacked astrophotography frame being swept by the sequencer, with the synth panel below](docs/screenshot.png)
+
 Occultation is an audio plugin (VST3 + Standalone, macOS) that turns light into sound. It watches an image source — from a camera, a local file, a network stream, or star chart — and converts brightness into notes in real time.
 
 ## How it works
