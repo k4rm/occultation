@@ -2,11 +2,11 @@
 
 ![The Occultation plugin running in a host: a stacked astrophotography frame being swept by the sequencer, with the synth panel below](docs/screenshot.png)
 
-Occultation is an audio plugin (VST3 + Standalone, macOS) that turns light into sound. It watches an image source — from a camera, a local file, a network stream, or star chart — and converts brightness into notes in real time.
+Occultation is an audio plugin (VST3 + Standalone, macOS) that turns light into music. It watches an image source — from a camera, a local file, a network stream, or star chart — and converts brightness into music in real time.
 
 ## How it works
 
-The sequencer is controlled by the number of steps, it runs over the image and choses the note to output depending on the brightness of the pixels it generates a note on the synthesizer : a cursor sweeps left to right across a bar (length set
+The sequencer runs over the image and chooses the pitch to output depending on the brightness of the pixels, it then generates a note on the synthesizer : in other words : a cursor sweeps left to right across a bar (length set
 by **Steps**), synced to host (or standalone) transport PPQ. At each step it
 samples 24 horizontal lanes (or, in Sky Map mode, a vertical strip of sky at
 the cursor's right ascension) and triggers whichever lane is brightest,
@@ -26,9 +26,9 @@ mapped onto the selected musical scale.
   - Panning past a pole wraps onto the opposite side of the sky (RA + 180°)
     instead of stopping — there's always more sky to reveal.
   - A "jump to constellation" picker floats over the view.
-- **Network Stream...** — `rtsp://`, `rtmp://`, `http(s)://` (including HLS).
-  Captured on a dedicated thread so a slow or stalled stream can't stall MIDI
-  generation; reconnects automatically with backoff if the connection drops.
+- **Network Stream...** — `rtsp://`, `rtmp://`, `http(s)://`. Captured on a
+  dedicated thread so a slow or stalled stream can't stall MIDI generation;
+  reconnects automatically with backoff if the connection drops.
 - **Cam 0–2** — built-in/USB cameras (AVFoundation).
 
 FITS files are read with a hand-rolled parser (no CFITSIO dependency) —
@@ -181,153 +181,41 @@ note it makes is musical rather than sci-fi decoration:
 
 ## Building
 
-Requires CMake, a C++17 toolchain, and OpenCV (`brew install opencv`).
-JUCE is fetched automatically via `FetchContent` on first configure (slow
-once, cached after).
+Requires CMake, a C++17 toolchain, OpenCV 5, and `dylibbundler`. JUCE is
+fetched automatically via `FetchContent` on first configure (slow once,
+cached after).
 
 ```
+brew install opencv dylibbundler
 cmake -S . -B build
 cmake --build build -j 8
 ```
 
-Also install `dylibbundler` (`brew install dylibbundler`). OpenCV is linked
-**statically**, but FFmpeg ships as four dylibs (`libavcodec`, `libavformat`,
-`libavutil`, `libswscale`); a post-build step copies them into each bundle's
-own `Contents/Frameworks` and rewrites the load commands to
-`@loader_path/../Frameworks`, so the built `.vst3`/`.app` runs on a machine
-with nothing installed. `@loader_path`, not `@executable_path`: the latter
-resolves against the *loading process*, which for a VST3 is the host, so the
-plugin would look for its dylibs next to Ableton's binary and fail to load.
-`cmake/dedupe_rpaths.sh` runs right after and collapses any duplicated rpath
-entry, which dyld refuses to load.
+That is enough to compile it and try it locally. Configure will warn that
+it is falling back to the system OpenCV; two things are worth knowing
+before you rely on such a build:
 
-Neither step is optional for distribution, but both are harmless locally:
-without `dylibbundler`, CMake warns and the bundles only run where the
-dependencies already sit at their build paths.
+- Homebrew's OpenCV links OpenBLAS, which links libomp. dylibbundler then
+  copies libomp into *every* plugin bundle, and a host that loads two of
+  our formats at once (Ableton scanning the VST3 and the AU together) gets
+  two libomp images at two paths. LLVM's OpenMP calls `abort()` on
+  duplicate registration and takes the host down with it.
+- Homebrew bottles are built for the build machine's own macOS, and
+  dyld enforces each bundled dylib's `LC_BUILD_VERSION` at load time — so
+  the plugin only runs on machines at least as new as the one that built it.
 
-`CMAKE_EXPORT_COMPILE_COMMANDS` is on and `compile_commands.json` is
-symlinked at the repo root for clangd/editor tooling — re-run configure
-whenever sources are added or removed so it stays current.
+### Building for distribution
 
-## Running
+Both problems come from the bottles, so release builds use OpenCV and
+FFmpeg compiled from source: static OpenCV with no OpenMP/LAPACK (no libomp
+anywhere in the graph), and a decode-only LGPL FFmpeg with no external
+codec libraries, both targeting macOS 11.
 
-- **Standalone**: `open build/OccultationPlugin_artefacts/Release/Standalone/Occultation.app`
-- **VST3**: built to `build/OccultationPlugin_artefacts/Release/VST3/Occultation.vst3`,
-  then a post-build step copies and ad-hoc codesigns it into
-  `~/Library/Audio/Plug-Ins/VST3/Occultation.vst3` for hosts like Ableton
-  Live to pick up automatically.
-
-It's a MIDI effect plugin (`IS_MIDI_EFFECT`, not a synth) that needs both
-MIDI in and out wired up in the host.
-
-## Packaging an installer
-
-The post-build steps above deploy into the *developer's* own `~/Library`, which
-is no use to anyone else — they'd have to be told where to drag three bundles.
-For distribution:
+FFmpeg first — 7.1.x specifically, because OpenCV 5.0 still reads
+`AVCodec::pix_fmts`, which FFmpeg 8 deprecated and 9 removed:
 
 ```
-cmake --build build --target installer
-```
-
-That produces `build/installer/Occultation-<version>.pkg`: one double-clickable
-installer with a format picker (VST3 / Audio Unit / Standalone, all selected by
-default), installing system-wide rather than per-user —
-
-| Choice | Installs to |
-| --- | --- |
-| VST3 Plug-In | `/Library/Audio/Plug-Ins/VST3` |
-| Audio Unit | `/Library/Audio/Plug-Ins/Components` |
-| Standalone Application | `/Applications` |
-
-`packaging/build_installer.sh` does the work (the CMake target is a thin wrapper
-that passes the build dir and version, and is deliberately outside `all` — it
-re-stages ~190MB of bundles). Notes on how it's put together:
-
-- One `pkgbuild` component package per format, since each has a different
-  install location, combined by `productbuild` using
-  `packaging/distribution.xml.in` plus the welcome/licence/conclusion screens in
-  `packaging/resources/`. The licence pane uses the repo's own `LICENSE`.
-- System domain, not `~/Library`. `productbuild` can target the home directory
-  via `enable_currentUserHome`, but that roots the whole payload under `~` —
-  including the standalone app, which belongs in `/Applications` — and remains
-  Apple's buggier path. `/Library/Audio/Plug-Ins` is scanned by every host for
-  every user, at the cost of one admin prompt, which is what commercial plugin
-  installers do.
-- Every component is forced non-relocatable (`pkgbuild --analyze`, then
-  `BundleIsRelocatable`/`BundleIsVersionChecked` set false via PlistBuddy).
-  pkgbuild defaults bundles to relocatable, which lets Installer redirect the
-  payload to wherever an older copy already sits — e.g. the `~/Library` one the
-  build's own post-build step just deployed — instead of the install location
-  asked for. That's the classic "installer reported success, host sees nothing".
-- Bundles are staged with `ditto` (preserves symlinks and the signature's
-  extended attributes, which `cp -r` can mangle) and `xattr -cr`'d, so the
-  payload can't install a quarantined plugin that hosts then refuse to load.
-- `hostArchitectures` and `allowed-os-versions` are read out of the built Mach-O
-  with `lipo`/`otool` rather than hardcoded, so the installer can't claim
-  compatibility the binary doesn't have.
-
-Signing and notarisation are optional flags; without them the installer is fine
-locally but any download of it hits Gatekeeper. With an Apple Developer ID:
-
-```
-./packaging/build_installer.sh \
-    --sign-app "Developer ID Application: NAME (TEAMID)" \
-    --sign-pkg "Developer ID Installer: NAME (TEAMID)" \
-    --notarize <notarytool-keychain-profile>
-```
-
-(or set `OCCULTATION_SIGN_APP` / `OCCULTATION_SIGN_PKG` /
-`OCCULTATION_NOTARIZE_PROFILE` in the CMake cache to have the `installer` target
-pass them). Signing walks inside-out — every bundled dylib, then the bundle —
-with the hardened runtime, a secure timestamp, and
-`packaging/hardened.entitlements`, which re-grants camera and audio-input
-access; JUCE's generated entitlements are empty dicts, which is fine ad-hoc but
-would leave the camera sources dead under the hardened runtime. `--notarize`
-needs a profile stored once with `xcrun notarytool store-credentials`.
-
-### The macOS floor
-
-Both the installer script and CMake configure report the same two limits, which
-as of now read:
-
-```
--- Occultation: dependencies allow macOS 11.0+ on arm64 (floor from OpenCV)
-==> Occultation 1.0.0  (arm64, macOS 11.0+)
-```
-
-macOS 11 covers every Apple Silicon Mac ever sold — they all shipped with Big
-Sur or later — so the floor is no longer a meaningful restriction on arm64.
-
-It used to be macOS **26**, and that was inherited rather than chosen. OpenCV
-and FFmpeg arrived as Homebrew bottles, built single-arch for whatever macOS
-the build machine ran (Tahoe → `minos 26.0`), and `dylibbundler` ships those
-dylibs *inside* every bundle, where dyld enforces each image's own
-`LC_BUILD_VERSION` at load time. Lowering this project's own deployment target
-did nothing: the bundles advertised macOS 11 and still died in dyld.
-
-The fix is to build both dependencies from source against the target we
-actually want, and to stop Homebrew's copies being discoverable while doing it.
-`CMAKE_OSX_DEPLOYMENT_TARGET` then means something again (it defaults to `11.0`
-near the top of `CMakeLists.txt`), and configure still verifies it against the
-real binaries rather than trusting the setting.
-
-Worth knowing *why* Homebrew's FFmpeg was so expensive: it is a full-fat build
-that dragged in 19 dylibs — x264, x265, SVT-AV1, vpx, dav1d, lame, opus, vmaf,
-OpenSSL and friends. Almost all of those are **encoders**, and this project only
-ever decodes. A decode-only FFmpeg needs none of them and comes to four dylibs
-totalling about 6 MB.
-
-#### Rebuilding FFmpeg
-
-LGPL 2.1 (no GPL components — that's what keeps x264/x265 out), decode only, no
-external libraries, HTTPS via Apple's Security framework rather than OpenSSL:
-
-```
-curl -LO https://ffmpeg.org/releases/ffmpeg-7.1.1.tar.xz
-tar xf ffmpeg-7.1.1.tar.xz && cd ffmpeg-7.1.1
-./configure \
-    --prefix="$HOME/Documents/dev/ffmpeg-lean/install" \
+./configure --prefix="$HOME/Documents/dev/ffmpeg-lean/install" \
     --enable-shared --disable-static \
     --disable-everything --disable-programs --disable-doc \
     --disable-avdevice --disable-avfilter --disable-postproc \
@@ -335,8 +223,8 @@ tar xf ffmpeg-7.1.1.tar.xz && cd ffmpeg-7.1.1
     --disable-vaapi --disable-vdpau --disable-iconv --disable-lzma --disable-bzlib \
     --enable-network --enable-securetransport \
     --enable-protocol=file,http,https,tcp,udp,rtp,rtmp,rtmps,rtmpt,tls,crypto,hls,httpproxy \
-    --enable-demuxer=rtsp,sdp,mov,flv,live_flv,mpegts,mpegtsraw,hls,matroska,avi,h264,hevc,mjpeg,image2 \
-    --enable-decoder=h264,hevc,mjpeg,mpeg4,mpeg2video,vp8,vp9,av1,rawvideo,aac,mp3,pcm_s16le \
+    --enable-demuxer=rtsp,sdp,mov,flv,live_flv,mpegts,mpegtsraw,hls,matroska,avi,h264,hevc,mjpeg,mpjpeg,image2,image2pipe,asf,dshow \
+    --enable-decoder=h264,hevc,mjpeg,mjpegb,mpeg4,mpeg2video,vp8,vp9,av1,rawvideo,aac,mp3,pcm_s16le \
     --enable-parser=h264,hevc,mjpeg,mpeg4video,mpegvideo,vp8,vp9,av1,aac \
     --enable-bsf=h264_mp4toannexb,hevc_mp4toannexb,extract_extradata \
     --extra-cflags="-mmacosx-version-min=11.0" \
@@ -344,76 +232,55 @@ tar xf ffmpeg-7.1.1.tar.xz && cd ffmpeg-7.1.1
 make -j8 && make install
 ```
 
-Confirm it prints `License: LGPL version 2.1 or later` and that
-`EXTRALIBS-avutil` in `ffbuild/config.mak` lists only system frameworks.
+`--disable-libxcb --disable-sdl2 --disable-xlib` are not optional: without
+them FFmpeg autodetects whatever Homebrew has installed and quietly links
+libX11 into libavutil. `mpjpeg` matters too — IP cameras commonly serve
+`multipart/x-mixed-replace`, and without that demuxer the stream connects
+and then fails to parse.
 
-Two traps:
-
-- **FFmpeg 7.1, not 8 or 9.** OpenCV 5.0's `cap_ffmpeg_impl.hpp` still reads
-  `AVCodec::pix_fmts` and `AVCodec::supported_framerates`, which FFmpeg 8
-  deprecated and 9 removed outright — it will not compile against a newer one.
-- **`--disable-libxcb --disable-sdl2`.** FFmpeg autodetects whatever Homebrew
-  has lying around; without these it quietly links `libX11` into `libavutil`
-  and reintroduces exactly the kind of foreign dependency this is avoiding.
-
-#### Rebuilding OpenCV
+Then OpenCV 5.0.0 against it:
 
 ```
-curl -LO https://github.com/opencv/opencv/archive/refs/tags/5.0.0.tar.gz
-tar xzf 5.0.0.tar.gz
 PKG_CONFIG_LIBDIR="$HOME/Documents/dev/ffmpeg-lean/install/lib/pkgconfig" \
 cmake -S opencv-5.0.0 -B ocv-build -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_INSTALL_PREFIX="$HOME/Documents/dev/opencv-lean/install" \
-    -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 \
-    -DCMAKE_OSX_ARCHITECTURES=arm64 \
-    -DBUILD_SHARED_LIBS=OFF \
-    -DBUILD_LIST=core,imgproc,imgcodecs,videoio,flann \
-    -DWITH_FFMPEG=ON -DWITH_AVFOUNDATION=ON \
-    -DOPENCV_FFMPEG_ENABLE_LIBAVDEVICE=OFF \
-    -DWITH_OPENMP=OFF -DWITH_LAPACK=OFF \
-    -DWITH_EIGEN=OFF -DWITH_PROTOBUF=OFF -DBUILD_PROTOBUF=OFF \
+    -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 -DCMAKE_OSX_ARCHITECTURES=arm64 \
+    -DBUILD_SHARED_LIBS=OFF -DBUILD_LIST=core,imgproc,imgcodecs,videoio,flann \
+    -DWITH_FFMPEG=ON -DWITH_AVFOUNDATION=ON -DOPENCV_FFMPEG_ENABLE_LIBAVDEVICE=OFF \
+    -DWITH_OPENMP=OFF -DWITH_LAPACK=OFF -DWITH_EIGEN=OFF \
+    -DWITH_PROTOBUF=OFF -DBUILD_PROTOBUF=OFF \
     -DBUILD_TESTS=OFF -DBUILD_PERF_TESTS=OFF -DBUILD_EXAMPLES=OFF \
-    -DBUILD_opencv_apps=OFF -DBUILD_DOCS=OFF -DBUILD_JAVA=OFF \
-    -DBUILD_opencv_python3=OFF
+    -DBUILD_opencv_apps=OFF -DBUILD_DOCS=OFF -DBUILD_JAVA=OFF -DBUILD_opencv_python3=OFF
 cmake --build ocv-build -j8 && cmake --install ocv-build
 ```
 
-`PKG_CONFIG_LIBDIR` is doing real work there — it *replaces* pkg-config's
-search path, where `PKG_CONFIG_PATH` only prepends to it. With the latter,
-OpenCV happily finds Homebrew's FFmpeg instead and silently puts the macOS 26
-floor straight back. Check the configure output names a path under
-`ffmpeg-lean/install`, and that it reports `FFMPEG: YES` and
-`AVFoundation: YES`.
+`PKG_CONFIG_LIBDIR`, not `PKG_CONFIG_PATH` — the latter only prepends, so
+OpenCV finds Homebrew's FFmpeg anyway and the floor goes straight back up.
+`WITH_EIGEN`/`WITH_PROTOBUF` off because either one makes the installed
+`OpenCVModules.cmake` export a link-interface target this project would
+then have to resolve, and protobuf's names a library the lean build never
+installs.
 
-Why the rest of these options:
+CMake picks both up automatically from those paths (override with
+`OCCULTATION_OPENCV_ROOT` / `OCCULTATION_FFMPEG_ROOT`). Configure then
+reports the floor it actually measured from the binaries:
 
-- `WITH_OPENMP=OFF` / `WITH_LAPACK=OFF` keep libomp and OpenBLAS out of the
-  graph entirely — see the long comment above `find_package(OpenCV)` in
-  `CMakeLists.txt` for the host crash that motivated it. OpenCV falls back to
-  GCD for threading on macOS.
-- `WITH_EIGEN=OFF`, `WITH_PROTOBUF=OFF`/`BUILD_PROTOBUF=OFF` matter at the
-  *consumer* end: with either enabled the installed `OpenCVModules.cmake`
-  exports a link-interface target (`Eigen3::Eigen`, `libprotobuf`) that this
-  project would then have to `find_package` for — and in protobuf's case it
-  names a static lib the lean build never installs, so configure fails outright.
-- `OPENCV_FFMPEG_ENABLE_LIBAVDEVICE=OFF` because the FFmpeg above has no
-  avdevice.
-- `BUILD_LIST` omits `geometry`; it gets pulled in as a dependency anyway.
+```
+-- Occultation: dependencies allow macOS 11.0+ on arm64 (floor from OpenCV)
+```
 
-#### Which backend handles what
+## Running
 
-`CAP_AVFOUNDATION` is pinned explicitly for cameras. Everything else goes
-through FFmpeg: local files (`.mp4`, `.mov`, `.m4v`, `.avi`, `.mkv`) and every
-network stream. HLS over `https://` is verified working; `rtsp://` and
-`rtmp://` are compiled in — an unreachable host reports "Connection refused"
-rather than "Protocol not found", which is the quick way to tell a missing
-protocol from a missing server.
+- **Standalone**: `open build/OccultationPlugin_artefacts/Release/Standalone/Occultation.app`
+- **VST3**: built to `build/OccultationPlugin_artefacts/Release/VST3/Occultation.vst3`,
+  then a post-build step copies and ad-hoc codesigns it into
+  `~/Library/Audio/Plug-Ins/VST3/Occultation.vst3` for hosts like Ableton Live to pick up automatically.
+
 
 ## TODO:
-- build and release for Windows & Linux, 
-- go universal for Intel Macs: add `x86_64` to the OpenCV *and* FFmpeg rebuilds and to `CMAKE_OSX_ARCHITECTURES` (the macOS floor itself is now 11.0 — see "The macOS floor" above). FFmpeg needs a separate build per architecture merged with `lipo`; it can't cross-build both at once.
-- get an Apple Developer ID and notarise the installer (the flags are already wired up)
+- build and release for Windows & Linux
+
    
 ## More info
 

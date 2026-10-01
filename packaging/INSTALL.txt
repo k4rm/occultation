@@ -1,0 +1,71 @@
+Occultation 1.0.0 — Installation
+================================
+
+REQUIREMENTS
+  - macOS 11 (Big Sur) or later
+  - Apple Silicon Mac (M1 or newer). Intel Macs are not supported yet.
+  - A VST3 or Audio Unit host, or use the standalone app.
+
+
+INSTALLING
+
+Double-click Occultation-1.0.0.pkg and follow the installer. You can
+choose any combination of VST3, Audio Unit and Standalone.
+
+  VST3 Plug-In  ->  /Library/Audio/Plug-Ins/VST3
+  Audio Unit    ->  /Library/Audio/Plug-Ins/Components
+  Standalone    ->  /Applications
+
+It installs system-wide, so macOS will ask for your password once.
+
+
+"APPLE CANNOT CHECK IT FOR MALICIOUS SOFTWARE"
+
+This is expected, and it is not a sign that anything is wrong.
+
+Occultation is not notarised by Apple — notarisation requires a paid
+Apple Developer account. macOS shows the same warning for every
+installer that hasn't been through it. The full source code is public
+(see below) if you would rather read it or build it yourself.
+
+To install anyway:
+
+  1. Double-click the .pkg. macOS blocks it. Click OK / Done.
+  2. Open  System Settings > Privacy & Security
+  3. Scroll down to the Security section. There is a line about
+     Occultation being blocked, with an "Open Anyway" button.
+  4. Click "Open Anyway", authenticate, and the installer runs.
+
+Step 1 is required: the button in step 3 only appears after macOS has
+blocked the file once.
+
+If you are still stuck, this removes the download quarantine flag
+directly. Open Terminal and run:
+
+  xattr -d com.apple.quarantine ~/Downloads/Occultation-1.0.0.pkg
+
+
+AFTER INSTALLING
+
+Occultation is a MIDI EFFECT, not an instrument. In your host you need
+to wire up BOTH MIDI in and MIDI out, and route its MIDI output to an
+instrument. The plugin also generates its own audio, so you will hear
+it directly as well.
+
+If your host doesn't list it immediately, rescan your plugins. Logic
+and Live cache their plugin lists.
+
+To hear something straight away, open the Source menu and pick one of
+the bundled astrophotographs (M 8, M 17, M 20, M 33, IC 1848,
+NGC 281). Press Play and the sequencer starts reading the image.
+
+Camera sources will ask for camera permission the first time.
+
+
+SOURCE AND SUPPORT
+
+  https://apokrypsi.com/occultation
+
+Occultation is open source under the BSD 3-Clause licence. It bundles
+FFmpeg (LGPL 2.1), built decode-only with no GPL components; the exact
+build configuration is documented in the project's README.
