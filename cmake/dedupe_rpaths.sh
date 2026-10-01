@@ -6,6 +6,11 @@
 # ("duplicate LC_RPATH"). This strips every occurrence of that one rpath
 # from each binary and re-adds exactly one clean copy.
 set -euo pipefail
+# An unmatched glob must expand to nothing rather than to the pattern itself:
+# with OpenCV linked statically and FFmpeg gone there are no bundled dylibs at
+# all, so Contents/Frameworks is empty and "$FRAMEWORKS_DIR"/*.dylib matches
+# nothing. Without this, the loop below would run once on the literal pattern.
+shopt -s nullglob
 
 BUNDLE_MACOS_DIR="$1"
 FRAMEWORKS_DIR="$2"
@@ -28,3 +33,9 @@ if [ -d "$FRAMEWORKS_DIR" ]; then
         [ -f "$dylib" ] && fix_one "$dylib"
     done
 fi
+
+# Exit cleanly even when the last thing attempted was a failed [ -f ] test.
+# Under `set -e` the script's exit status is that of its final command, so an
+# empty Frameworks directory (nothing to bundle) otherwise fails the build
+# with no error message of its own - which is exactly what it used to do.
+exit 0

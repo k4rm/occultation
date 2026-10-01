@@ -26,9 +26,9 @@ mapped onto the selected musical scale.
   - Panning past a pole wraps onto the opposite side of the sky (RA + 180°)
     instead of stopping — there's always more sky to reveal.
   - A "jump to constellation" picker floats over the view.
-- **Network Stream...** — `rtsp://`, `rtmp://`, `http(s)://`. Captured on a
-  dedicated thread so a slow or stalled stream can't stall MIDI generation;
-  reconnects automatically with backoff if the connection drops.
+- **Network Stream...** — `rtsp://`, `rtmp://`, `http(s)://` (including HLS).
+  Captured on a dedicated thread so a slow or stalled stream can't stall MIDI
+  generation; reconnects automatically with backoff if the connection drops.
 - **Cam 0–2** — built-in/USB cameras (AVFoundation).
 
 FITS files are read with a hand-rolled parser (no CFITSIO dependency) —
@@ -190,16 +190,20 @@ cmake -S . -B build
 cmake --build build -j 8
 ```
 
-Also install `dylibbundler` (`brew install dylibbundler`): a post-build step
-copies OpenCV's dylibs (and FFmpeg's, underneath those) into each bundle's
+Also install `dylibbundler` (`brew install dylibbundler`). OpenCV is linked
+**statically**, but FFmpeg ships as four dylibs (`libavcodec`, `libavformat`,
+`libavutil`, `libswscale`); a post-build step copies them into each bundle's
 own `Contents/Frameworks` and rewrites the load commands to
-`@executable_path/../Frameworks`, so the built `.vst3`/`.app` runs on a
-machine with neither installed. Without it, CMake configure emits a warning
-and the built bundles only run where OpenCV/FFmpeg are already on the
-system. `cmake/dedupe_rpaths.sh` runs right after — dylibbundler can leave a
-dylib reached through more than one OpenCV module (OpenEXR, SuiteSparse)
-with the same rpath entry added twice, which dyld then refuses to load; the
-script collapses each binary back to one.
+`@loader_path/../Frameworks`, so the built `.vst3`/`.app` runs on a machine
+with nothing installed. `@loader_path`, not `@executable_path`: the latter
+resolves against the *loading process*, which for a VST3 is the host, so the
+plugin would look for its dylibs next to Ableton's binary and fail to load.
+`cmake/dedupe_rpaths.sh` runs right after and collapses any duplicated rpath
+entry, which dyld refuses to load.
+
+Neither step is optional for distribution, but both are harmless locally:
+without `dylibbundler`, CMake warns and the bundles only run where the
+dependencies already sit at their build paths.
 
 `CMAKE_EXPORT_COMPILE_COMMANDS` is on and `compile_commands.json` is
 symlinked at the repo root for clangd/editor tooling — re-run configure
@@ -282,59 +286,133 @@ access; JUCE's generated entitlements are empty dicts, which is fine ad-hoc but
 would leave the camera sources dead under the hardened runtime. `--notarize`
 needs a profile stored once with `xcrun notarytool store-credentials`.
 
-### The macOS floor (and why it isn't a CMake flag)
+### The macOS floor
 
 Both the installer script and CMake configure report the same two limits, which
 as of now read:
 
 ```
--- Occultation: dependencies allow macOS 26.0+ on arm64 (floor from OpenCV)
-==> Occultation 1.0.0  (arm64, macOS 26.0+)
+-- Occultation: dependencies allow macOS 11.0+ on arm64 (floor from OpenCV)
+==> Occultation 1.0.0  (arm64, macOS 11.0+)
 ```
 
-That floor is inherited from the dependencies, not chosen here, which is why
-neither `CMAKE_OSX_DEPLOYMENT_TARGET` nor `CMAKE_OSX_ARCHITECTURES` is set by
-this project. OpenCV and FFmpeg come from Homebrew bottles built single-arch for
-the build machine's macOS (Tahoe → `minos 26.0`), and dylibbundler ships FFmpeg's
+macOS 11 covers every Apple Silicon Mac ever sold — they all shipped with Big
+Sur or later — so the floor is no longer a meaningful restriction on arm64.
+
+It used to be macOS **26**, and that was inherited rather than chosen. OpenCV
+and FFmpeg arrived as Homebrew bottles, built single-arch for whatever macOS
+the build machine ran (Tahoe → `minos 26.0`), and `dylibbundler` ships those
 dylibs *inside* every bundle, where dyld enforces each image's own
-`LC_BUILD_VERSION` at load time. So:
+`LC_BUILD_VERSION` at load time. Lowering this project's own deployment target
+did nothing: the bundles advertised macOS 11 and still died in dyld.
 
-- Setting `CMAKE_OSX_DEPLOYMENT_TARGET=11.0` alone yields a plugin that
-  advertises macOS 11 and still dies in dyld on anything below 26 — worse than
-  today, because the installer's gate believes the advertised number.
-- Adding `x86_64` alone fails at link: there's no x86_64 slice to link against.
+The fix is to build both dependencies from source against the target we
+actually want, and to stop Homebrew's copies being discoverable while doing it.
+`CMAKE_OSX_DEPLOYMENT_TARGET` then means something again (it defaults to `11.0`
+near the top of `CMakeLists.txt`), and configure still verifies it against the
+real binaries rather than trusting the setting.
 
-Configure checks both against the actual dependency binaries (`otool`/`lipo` on
-OpenCV's static lib and Homebrew's `libavcodec`) and warns if you set either
-past what the dependencies allow. The installer script does the same over every
-Mach-O it's about to package — the plugin binary plus all ~19 bundled dylibs —
-and takes the *maximum* `minos` and the *intersection* of architectures, so the
-`.pkg`'s `allowed-os-versions`/`hostArchitectures` gate can't promise more than
-the payload delivers.
+Worth knowing *why* Homebrew's FFmpeg was so expensive: it is a full-fat build
+that dragged in 19 dylibs — x264, x265, SVT-AV1, vpx, dav1d, lame, opus, vmaf,
+OpenSSL and friends. Almost all of those are **encoders**, and this project only
+ever decodes. A decode-only FFmpeg needs none of them and comes to four dylibs
+totalling about 6 MB.
 
-Lowering the floor for real means rebuilding the dependencies first:
+#### Rebuilding FFmpeg
 
-1. **OpenCV** — reconfigure the lean static build at
-   `~/Documents/dev/opencv-lean/install` (modules: core, imgproc, imgcodecs,
-   videoio, flann, geometry; `BUILD_SHARED_LIBS=OFF`, `WITH_OPENMP=OFF`,
-   `WITH_LAPACK=OFF` — see the comment at the top of `CMakeLists.txt` for why
-   those three matter) adding
-   `-DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"`.
-2. **FFmpeg** — Homebrew can't produce this; it needs a source build per
-   architecture with `--extra-cflags=-mmacosx-version-min=11.0` (plus the
-   matching `--extra-ldflags`), the two then merged with `lipo`, and
-   `OpenCV`'s videoio pointed at that instead of the bottle.
-3. Rebuild Occultation with the same two variables, and confirm the numbers the
-   installer prints actually moved.
+LGPL 2.1 (no GPL components — that's what keeps x264/x265 out), decode only, no
+external libraries, HTTPS via Apple's Security framework rather than OpenSSL:
 
-Until that's done, the honest answer is that this is an Apple-Silicon,
-current-macOS build, and the installer says so rather than failing later on
-someone else's machine.
+```
+curl -LO https://ffmpeg.org/releases/ffmpeg-7.1.1.tar.xz
+tar xf ffmpeg-7.1.1.tar.xz && cd ffmpeg-7.1.1
+./configure \
+    --prefix="$HOME/Documents/dev/ffmpeg-lean/install" \
+    --enable-shared --disable-static \
+    --disable-everything --disable-programs --disable-doc \
+    --disable-avdevice --disable-avfilter --disable-postproc \
+    --disable-libxcb --disable-sdl2 --disable-xlib \
+    --disable-vaapi --disable-vdpau --disable-iconv --disable-lzma --disable-bzlib \
+    --enable-network --enable-securetransport \
+    --enable-protocol=file,http,https,tcp,udp,rtp,rtmp,rtmps,rtmpt,tls,crypto,hls,httpproxy \
+    --enable-demuxer=rtsp,sdp,mov,flv,live_flv,mpegts,mpegtsraw,hls,matroska,avi,h264,hevc,mjpeg,image2 \
+    --enable-decoder=h264,hevc,mjpeg,mpeg4,mpeg2video,vp8,vp9,av1,rawvideo,aac,mp3,pcm_s16le \
+    --enable-parser=h264,hevc,mjpeg,mpeg4video,mpegvideo,vp8,vp9,av1,aac \
+    --enable-bsf=h264_mp4toannexb,hevc_mp4toannexb,extract_extradata \
+    --extra-cflags="-mmacosx-version-min=11.0" \
+    --extra-ldflags="-mmacosx-version-min=11.0"
+make -j8 && make install
+```
 
+Confirm it prints `License: LGPL version 2.1 or later` and that
+`EXTRALIBS-avutil` in `ffbuild/config.mak` lists only system frameworks.
+
+Two traps:
+
+- **FFmpeg 7.1, not 8 or 9.** OpenCV 5.0's `cap_ffmpeg_impl.hpp` still reads
+  `AVCodec::pix_fmts` and `AVCodec::supported_framerates`, which FFmpeg 8
+  deprecated and 9 removed outright — it will not compile against a newer one.
+- **`--disable-libxcb --disable-sdl2`.** FFmpeg autodetects whatever Homebrew
+  has lying around; without these it quietly links `libX11` into `libavutil`
+  and reintroduces exactly the kind of foreign dependency this is avoiding.
+
+#### Rebuilding OpenCV
+
+```
+curl -LO https://github.com/opencv/opencv/archive/refs/tags/5.0.0.tar.gz
+tar xzf 5.0.0.tar.gz
+PKG_CONFIG_LIBDIR="$HOME/Documents/dev/ffmpeg-lean/install/lib/pkgconfig" \
+cmake -S opencv-5.0.0 -B ocv-build -G Ninja \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX="$HOME/Documents/dev/opencv-lean/install" \
+    -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 \
+    -DCMAKE_OSX_ARCHITECTURES=arm64 \
+    -DBUILD_SHARED_LIBS=OFF \
+    -DBUILD_LIST=core,imgproc,imgcodecs,videoio,flann \
+    -DWITH_FFMPEG=ON -DWITH_AVFOUNDATION=ON \
+    -DOPENCV_FFMPEG_ENABLE_LIBAVDEVICE=OFF \
+    -DWITH_OPENMP=OFF -DWITH_LAPACK=OFF \
+    -DWITH_EIGEN=OFF -DWITH_PROTOBUF=OFF -DBUILD_PROTOBUF=OFF \
+    -DBUILD_TESTS=OFF -DBUILD_PERF_TESTS=OFF -DBUILD_EXAMPLES=OFF \
+    -DBUILD_opencv_apps=OFF -DBUILD_DOCS=OFF -DBUILD_JAVA=OFF \
+    -DBUILD_opencv_python3=OFF
+cmake --build ocv-build -j8 && cmake --install ocv-build
+```
+
+`PKG_CONFIG_LIBDIR` is doing real work there — it *replaces* pkg-config's
+search path, where `PKG_CONFIG_PATH` only prepends to it. With the latter,
+OpenCV happily finds Homebrew's FFmpeg instead and silently puts the macOS 26
+floor straight back. Check the configure output names a path under
+`ffmpeg-lean/install`, and that it reports `FFMPEG: YES` and
+`AVFoundation: YES`.
+
+Why the rest of these options:
+
+- `WITH_OPENMP=OFF` / `WITH_LAPACK=OFF` keep libomp and OpenBLAS out of the
+  graph entirely — see the long comment above `find_package(OpenCV)` in
+  `CMakeLists.txt` for the host crash that motivated it. OpenCV falls back to
+  GCD for threading on macOS.
+- `WITH_EIGEN=OFF`, `WITH_PROTOBUF=OFF`/`BUILD_PROTOBUF=OFF` matter at the
+  *consumer* end: with either enabled the installed `OpenCVModules.cmake`
+  exports a link-interface target (`Eigen3::Eigen`, `libprotobuf`) that this
+  project would then have to `find_package` for — and in protobuf's case it
+  names a static lib the lean build never installs, so configure fails outright.
+- `OPENCV_FFMPEG_ENABLE_LIBAVDEVICE=OFF` because the FFmpeg above has no
+  avdevice.
+- `BUILD_LIST` omits `geometry`; it gets pulled in as a dependency anyway.
+
+#### Which backend handles what
+
+`CAP_AVFOUNDATION` is pinned explicitly for cameras. Everything else goes
+through FFmpeg: local files (`.mp4`, `.mov`, `.m4v`, `.avi`, `.mkv`) and every
+network stream. HLS over `https://` is verified working; `rtsp://` and
+`rtmp://` are compiled in — an unreachable host reports "Connection refused"
+rather than "Protocol not found", which is the quick way to tell a missing
+protocol from a missing server.
 
 ## TODO:
 - build and release for Windows & Linux, 
-- lower the macOS floor / go universal: needs OpenCV *and* FFmpeg rebuilt first (arm64-only, macOS-26-only right now — see "The macOS floor" above)
+- go universal for Intel Macs: add `x86_64` to the OpenCV *and* FFmpeg rebuilds and to `CMAKE_OSX_ARCHITECTURES` (the macOS floor itself is now 11.0 — see "The macOS floor" above). FFmpeg needs a separate build per architecture merged with `lipo`; it can't cross-build both at once.
 - get an Apple Developer ID and notarise the installer (the flags are already wired up)
    
 ## More info

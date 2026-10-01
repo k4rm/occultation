@@ -16,6 +16,25 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# macOS floor. Every Apple Silicon Mac ever sold shipped with macOS 11 or
+# later, so this covers the whole arm64 install base rather than only machines
+# on the newest OS.
+#
+# This USED to be deliberately unset, because the floor was dictated by
+# dependencies rather than by us: OpenCV and FFmpeg arrived as Homebrew bottles
+# built for the build machine's own macOS (minos 26.0), dylibbundler shipped
+# those dylibs inside every bundle, and dyld enforces each image's
+# LC_BUILD_VERSION at load time — so claiming a lower target here produced a
+# plugin that advertised macOS 11 and still died in dyld.
+#
+# Both dependencies are now built from source against this same target instead
+# (see the OpenCV section below and the README's "The macOS floor"), so nothing
+# in the bundle imposes a floor we didn't choose. Section 2a still verifies
+# that against the real binaries rather than trusting this line.
+if(APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
+    set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0" CACHE STRING "Minimum macOS version" FORCE)
+endif()
+
 # 1. Fetch JUCE (adjust GIT_TAG to your preferred version or use a local path via add_subdirectory)
 include(FetchContent)
 FetchContent_Declare(
@@ -51,6 +70,15 @@ else()
         "system OpenCV. If that one links OpenBLAS/libomp, loading two plugin formats in one host "
         "(e.g. Ableton scanning both VST3 and AU) will abort the host. See README.")
 endif()
+# 2a-pre. The lean FFmpeg this project builds from source (LGPL 2.1, decode
+# only, no external codec libraries, built for CMAKE_OSX_DEPLOYMENT_TARGET).
+# OpenCV's videoio links against it for rtsp/rtmp/http(s) capture; local files
+# and cameras go through AVFoundation instead. PKG_CONFIG_LIBDIR (not
+# PKG_CONFIG_PATH) is what keeps OpenCV's own detection off a Homebrew ffmpeg —
+# see the README's rebuild recipe.
+set(OCCULTATION_FFMPEG_ROOT "$ENV{HOME}/Documents/dev/ffmpeg-lean/install"
+    CACHE PATH "Root of the lean LGPL FFmpeg build (see README)")
+
 find_package(OpenCV REQUIRED)
 
 # 2a. Report the macOS floor the *dependencies* impose, and check any
@@ -72,11 +100,15 @@ if(APPLE)
         list(APPEND _dep_names "OpenCV")
         list(APPEND _dep_paths "${OCCULTATION_OPENCV_ROOT}/lib/libopencv_core.a")
     endif()
-    execute_process(COMMAND brew --prefix ffmpeg
-                    OUTPUT_VARIABLE _ffmpeg_prefix OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
-    if(_ffmpeg_prefix AND EXISTS "${_ffmpeg_prefix}/lib/libavcodec.dylib")
+    # FFmpeg, from the lean LGPL build this project ships (see
+    # OCCULTATION_FFMPEG_ROOT above) — deliberately NOT `brew --prefix ffmpeg`.
+    # Homebrew's bottle is built for the build machine's own macOS and would
+    # report a floor that has nothing to do with what actually goes in the
+    # bundle; these five dylibs are the ones dylibbundler copies, so these are
+    # the ones whose LC_BUILD_VERSION dyld will enforce on a user's machine.
+    if(EXISTS "${OCCULTATION_FFMPEG_ROOT}/lib/libavcodec.dylib")
         list(APPEND _dep_names "FFmpeg")
-        list(APPEND _dep_paths "${_ffmpeg_prefix}/lib/libavcodec.dylib")
+        list(APPEND _dep_paths "${OCCULTATION_FFMPEG_ROOT}/lib/libavcodec.dylib")
     endif()
 
     set(_dep_min_os "")
