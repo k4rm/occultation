@@ -14,6 +14,9 @@ class WaveformIconSelector;
 // their changes to the processor, and reads processor state to render.
 class VisionMidiEditor : public juce::AudioProcessorEditor,
                          public juce::FileDragAndDropTarget,
+                         // Object mode's colour picker is a ChangeBroadcaster;
+                         // this is how its live updates get back here.
+                         public juce::ChangeListener,
                          private juce::Timer
 {
 public:
@@ -117,6 +120,28 @@ private:
     // just reads as clutter. resized() skips its row entirely when hidden, so
     // everything below closes up rather than leaving a gap.
     juce::ToggleButton invaderStreakToggle;
+
+    // --- Object mode ------------------------------------------------------
+    // Click an object to select it; drag it and let go to throw it; hold Alt
+    // and drag to trace a looping path. The inspector below only appears once
+    // something is selected, so the panel isn't cluttered the rest of the time.
+    juce::ToggleButton objectModeToggle;
+    juce::ComboBox     objectPathShapeSelector;
+    juce::Slider       objectPathSpeedSlider;
+    juce::Slider       objectBlinkRateSlider;
+    juce::TextButton   objectTintButton { "Colour" };
+    juce::TextButton   objectResetButton { "Reset" };
+    void changeListenerCallback (juce::ChangeBroadcaster* source) override;
+    void updateObjectInspectorVisibility();
+    void refreshObjectInspector();
+
+    // Drag state for the throw/draw gestures.
+    bool isDraggingObject = false;
+    bool isDrawingPath = false;
+    int  draggedObject = -1;
+    juce::Point<float> objectDragLastPos;
+    juce::Point<float> objectDragVelocity;
+    std::vector<cv::Point2f> drawnPath;
     // Last streak count pushed into the toggle's label, so timerCallback only
     // touches the button (and repaints) when the number actually changes.
     int lastShownInvaderStreak = -1;

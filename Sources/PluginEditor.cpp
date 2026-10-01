@@ -591,6 +591,79 @@ VisionMidiEditor::VisionMidiEditor (VisionMidiProcessor& p)
         grabKeyboardFocus();   // arrow keys/Space need to reach keyPressed() right away, not a click elsewhere first
     };
 
+    // --- Object mode ------------------------------------------------------
+    addAndMakeVisible (objectModeToggle);
+    objectModeToggle.setButtonText ("Bounce Mode");
+    objectModeToggle.setTooltip ("Click an object to select it. Drag and release to throw it - it "
+                                 "bounces off the edges of the view and off other objects. "
+                                 "Alt-drag to trace a looping path. Cmd+click to make it blink.");
+    objectModeToggle.setToggleState (audioProcessor.objectModeEnabled.load(), juce::dontSendNotification);
+    objectModeToggle.onClick = [this] {
+        const bool on = objectModeToggle.getToggleState();
+        audioProcessor.objectModeEnabled.store (on);
+        // Detect immediately on enable, so the mode is usable without the
+        // user having to find the button first.
+        if (on && audioProcessor.objectCount() == 0)
+            audioProcessor.objectDetectPending.store (true);
+        updateObjectInspectorVisibility();
+        resized();
+    };
+
+    addChildComponent (objectPathShapeSelector);
+    objectPathShapeSelector.addItem ("Drawn", 1);
+    objectPathShapeSelector.addItem ("Circle", 2);
+    objectPathShapeSelector.addItem ("Ellipse", 3);
+    objectPathShapeSelector.addItem ("Figure 8", 4);
+    objectPathShapeSelector.onChange = [this] {
+        const int sel = audioProcessor.selectedObject.load();
+        if (sel < 0) return;
+        audioProcessor.setObjectPathShape (sel,
+            (VisionMidiProcessor::ObjectPathShape) (objectPathShapeSelector.getSelectedId() - 1));
+    };
+
+    addChildComponent (objectPathSpeedSlider);
+    objectPathSpeedSlider.setSliderStyle (juce::Slider::LinearHorizontal);
+    objectPathSpeedSlider.setTextBoxStyle (juce::Slider::TextBoxRight, false, 44, 18);
+    objectPathSpeedSlider.setRange (0.05, 8.0, 0.05);
+    objectPathSpeedSlider.setValue (1.0, juce::dontSendNotification);
+    objectPathSpeedSlider.onValueChange = [this] {
+        const int sel = audioProcessor.selectedObject.load();
+        if (sel >= 0) audioProcessor.setObjectPathSpeed (sel, (float) objectPathSpeedSlider.getValue());
+    };
+
+    addChildComponent (objectBlinkRateSlider);
+    objectBlinkRateSlider.setSliderStyle (juce::Slider::LinearHorizontal);
+    objectBlinkRateSlider.setTextBoxStyle (juce::Slider::TextBoxRight, false, 44, 18);
+    objectBlinkRateSlider.setRange (0.1, 20.0, 0.1);
+    objectBlinkRateSlider.setValue (2.0, juce::dontSendNotification);
+    objectBlinkRateSlider.onValueChange = [this] {
+        const int sel = audioProcessor.selectedObject.load();
+        if (sel >= 0 && audioProcessor.objectState (sel).blink)
+            audioProcessor.setObjectBlink (sel, true, (float) objectBlinkRateSlider.getValue());
+    };
+
+    addChildComponent (objectTintButton);
+    objectTintButton.onClick = [this] {
+        const int sel = audioProcessor.selectedObject.load();
+        if (sel < 0) return;
+        auto* picker = new juce::ColourSelector (juce::ColourSelector::showColourspace
+                                                 | juce::ColourSelector::showSliders);
+        picker->setSize (300, 260);
+        picker->setCurrentColour (juce::Colours::white);
+        // The tint multiplies the object's own pixels, so white means "as
+        // found" and anything darker both colours and dims it.
+        picker->addChangeListener (this);
+        juce::CallOutBox::launchAsynchronously (std::unique_ptr<juce::Component> (picker),
+                                                objectTintButton.getScreenBounds(), nullptr);
+    };
+
+    addChildComponent (objectResetButton);
+    objectResetButton.onClick = [this] {
+        const int sel = audioProcessor.selectedObject.load();
+        if (sel >= 0) audioProcessor.resetObject (sel);
+        refreshObjectInspector();
+    };
+
     // Streak modulation — a sub-option of Invader mode, so it's added but only
     // made visible while that mode is on (see the member's comment).
     addChildComponent (invaderStreakToggle);
@@ -858,8 +931,14 @@ void VisionMidiEditor::setupSynthPanel()
         addAndMakeVisible (knob->slider);
         knob->attachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (apvts, paramId, knob->slider);
 
-        knob->label.setText (labelText, juce::dontSendNotification);
-        knob->label.setFont (juce::Font (14.0f, juce::Font::bold));
+        // Upper case, brighter than the default ash grey, and allowed to
+        // condense rather than elide. These sit at roughly 80px per knob, and
+        // a word like RESONANCE needs every one of them; without the minimum
+        // horizontal scale JUCE would cut it to "RESONAN..." instead.
+        knob->label.setText (juce::String (labelText).toUpperCase(), juce::dontSendNotification);
+        knob->label.setFont (juce::Font (juce::FontOptions (12.0f).withStyle ("Bold")));
+        knob->label.setColour (juce::Label::textColourId, OccultPalette::boneWhite);
+        knob->label.setMinimumHorizontalScale (0.55f);
         knob->label.setJustificationType (juce::Justification::centred);
         addAndMakeVisible (knob->label);
 
@@ -1017,9 +1096,13 @@ void VisionMidiEditor::layoutSynthPanel (juce::Rectangle<int> area)
         // knob. Capping the slider's height at its own width keeps the
         // circle pinned to the top, right against the label; any leftover
         // height is pushed below the knob instead, where it's invisible.
-        knob->label.setBounds (slot.getX(), slot.getY(), knobW, 11);
-        int sliderH = juce::jmin (slot.getHeight() - 11, knobW);
-        knob->slider.setBounds (slot.getX(), slot.getY() + 11, knobW, sliderH);
+        // 15px, not 11: the label row was shorter than its own font, so every
+        // caption was being clipped top and bottom - most of why they were
+        // hard to read in the first place.
+        constexpr int labelH = 15;
+        knob->label.setBounds (slot.getX(), slot.getY(), knobW, labelH);
+        int sliderH = juce::jmin (slot.getHeight() - labelH, knobW);
+        knob->slider.setBounds (slot.getX(), slot.getY() + labelH, knobW, sliderH);
     }
 }
 
@@ -1086,9 +1169,103 @@ bool VisionMidiEditor::keyPressed (const juce::KeyPress& key) {
     return juce::AudioProcessorEditor::keyPressed (key);
 }
 
+void VisionMidiEditor::changeListenerCallback (juce::ChangeBroadcaster* source) {
+    // Only the object-mode colour picker broadcasts to us.
+    if (auto* picker = dynamic_cast<juce::ColourSelector*> (source)) {
+        const int sel = audioProcessor.selectedObject.load();
+        if (sel < 0) return;
+        const juce::Colour c = picker->getCurrentColour();
+        // White means "leave the object as photographed" - the tint is a
+        // multiplier over its own pixels, not a replacement colour, so the
+        // nebula keeps its texture instead of turning into a flat blob.
+        audioProcessor.setObjectTint (sel, c != juce::Colours::white,
+                                      c.getFloatRed(), c.getFloatGreen(), c.getFloatBlue());
+        objectTintButton.setColour (juce::TextButton::buttonColourId, c.withAlpha (0.6f));
+    }
+}
+
+void VisionMidiEditor::updateObjectInspectorVisibility() {
+    const bool on = audioProcessor.objectModeEnabled.load();
+    const bool hasSelection = on && audioProcessor.selectedObject.load() >= 0;
+
+    // Detection is automatic now, collisions always sound, and motion is set by
+    // the gesture itself - drag to throw, Alt-drag to draw a path - so none of
+    // those need a control. What's left describes the selected object only, and
+    // only the parts of it that currently apply.
+    const auto st = hasSelection ? audioProcessor.objectState (audioProcessor.selectedObject.load())
+                                 : VisionMidiProcessor::ObjectState{};
+
+    objectTintButton.setVisible (hasSelection);
+    objectResetButton.setVisible (hasSelection);
+    objectBlinkRateSlider.setVisible (hasSelection && st.blink);
+
+    const bool pathing = hasSelection && st.motion == VisionMidiProcessor::ObjectMotion::Path;
+    objectPathShapeSelector.setVisible (pathing);
+    objectPathSpeedSlider.setVisible (pathing);
+    resized();
+}
+
+void VisionMidiEditor::refreshObjectInspector() {
+    const int sel = audioProcessor.selectedObject.load();
+    if (sel < 0) return;
+    // Pull the selected object's own settings into the controls. Every setter
+    // is dontSendNotification: selecting a different object must not push the
+    // previous one's values onto it.
+    const auto st = audioProcessor.objectState (sel);
+    if (! st.valid) return;
+    objectBlinkRateSlider.setValue ((double) st.blinkHz, juce::dontSendNotification);
+    objectPathSpeedSlider.setValue ((double) st.pathSpeed, juce::dontSendNotification);
+    objectPathShapeSelector.setSelectedId ((int) st.pathShape + 1, juce::dontSendNotification);
+}
+
 void VisionMidiEditor::mouseDown (const juce::MouseEvent& e) {
     if (! lastVideoBounds.contains (e.position))
         return;
+
+    // Bounce mode claims clicks that land ON an object, before panning or
+    // rotating can start — otherwise every attempt to grab a star would drag
+    // the whole view instead. A click on empty sky still falls through, so pan
+    // and Cmd-rotate stay reachable while the mode is on.
+    if (audioProcessor.objectModeEnabled.load()) {
+        const float vx = (e.position.x - lastVideoBounds.getX()) / lastVideoBounds.getWidth();
+        const float vy = (e.position.y - lastVideoBounds.getY()) / lastVideoBounds.getHeight();
+        const int hit = audioProcessor.objectAtViewPoint (vx, vy);
+
+        // Cmd+click toggles blink on the object under the cursor. Checked
+        // before the drag gestures so the click never also throws it; Cmd on
+        // empty sky still starts a view rotation.
+        if (hit >= 0 && e.mods.isCommandDown()) {
+            audioProcessor.selectedObject.store (hit);
+            audioProcessor.toggleObjectBlink (hit);
+            refreshObjectInspector();
+            updateObjectInspectorVisibility();
+            return;
+        }
+
+        if (hit >= 0 && ! e.mods.isCommandDown()) {
+            audioProcessor.selectedObject.store (hit);
+            draggedObject = hit;
+            objectDragLastPos = e.position;
+            objectDragVelocity = {};
+            if (e.mods.isAltDown()) {
+                isDrawingPath = true;
+                drawnPath.clear();
+                drawnPath.push_back ({ vx, vy });
+            } else {
+                isDraggingObject = true;
+            }
+            refreshObjectInspector();
+            updateObjectInspectorVisibility();
+            setMouseCursor (juce::MouseCursor::DraggingHandCursor);
+            return;
+        }
+        // Clicked empty sky: deselect, then fall through to the normal
+        // pan/rotate handling below.
+        if (hit < 0) {
+            audioProcessor.selectedObject.store (-1);
+            updateObjectInspectorVisibility();
+        }
+    }
 
     // Cmd+drag rotates instead of panning, in every mode (sky map included)
     // — checked first since it overrides the pan/RA-Dec-drag this same
@@ -1112,6 +1289,33 @@ void VisionMidiEditor::mouseDown (const juce::MouseEvent& e) {
 }
 
 void VisionMidiEditor::mouseDrag (const juce::MouseEvent& e) {
+    if (isDraggingObject || isDrawingPath) {
+        if (lastVideoBounds.getWidth() <= 0.0f) return;
+        const float vx = (e.position.x - lastVideoBounds.getX()) / lastVideoBounds.getWidth();
+        const float vy = (e.position.y - lastVideoBounds.getY()) / lastVideoBounds.getHeight();
+
+        if (isDrawingPath) {
+            // Thin the samples out: at 60Hz a slow drag would otherwise store
+            // hundreds of near-identical points and the loop would crawl
+            // through them unevenly.
+            if (drawnPath.empty()
+                || cv::norm (cv::Point2f (vx, vy) - drawnPath.back()) > 0.012) {
+                drawnPath.push_back ({ vx, vy });
+            }
+        } else {
+            // Carry the object with the cursor, and keep the most recent
+            // movement as the throw velocity for mouseUp. Averaged with the
+            // previous delta so one jittery final sample can't send it flying.
+            const juce::Point<float> delta = e.position - objectDragLastPos;
+            objectDragLastPos = e.position;
+            objectDragVelocity = objectDragVelocity * 0.6f + delta * 0.4f;
+            audioProcessor.setObjectMotion (draggedObject, VisionMidiProcessor::ObjectMotion::Free);
+            audioProcessor.throwObject (draggedObject, 0.0f, 0.0f);   // held, not yet flying
+            audioProcessor.placeObjectAtView (draggedObject, vx, vy);
+        }
+        return;
+    }
+
     if (isRotatingView) {
         // A genuine "grab and twist" gesture rather than a linear
         // pixels-to-degrees mapping: the rotation delta is the angle swept
@@ -1175,6 +1379,32 @@ void VisionMidiEditor::mouseDrag (const juce::MouseEvent& e) {
 }
 
 void VisionMidiEditor::mouseUp (const juce::MouseEvent&) {
+    if (isDrawingPath) {
+        isDrawingPath = false;
+        if (drawnPath.size() >= 3)
+            audioProcessor.setObjectDrawnPathFromView (draggedObject, drawnPath);
+        drawnPath.clear();
+        draggedObject = -1;
+        refreshObjectInspector();
+        setMouseCursor (juce::MouseCursor::NormalCursor);
+        return;
+    }
+    if (isDraggingObject) {
+        isDraggingObject = false;
+        // Release = throw. Scale screen pixels per event into normalised
+        // units per ~30ms tick; the 0.35 is pure feel, tuned so a brisk flick
+        // crosses the frame in about a second rather than instantly.
+        if (lastVideoBounds.getWidth() > 0.0f) {
+            const float vx = objectDragVelocity.x / lastVideoBounds.getWidth() * 0.35f;
+            const float vy = objectDragVelocity.y / lastVideoBounds.getHeight() * 0.35f;
+            audioProcessor.throwObject (draggedObject, vx, vy);
+        }
+        draggedObject = -1;
+        refreshObjectInspector();
+        setMouseCursor (juce::MouseCursor::NormalCursor);
+        return;
+    }
+
     if (isPanningSkyMap || isPanningView || isRotatingView) {
         isPanningSkyMap = false;
         isPanningView = false;
@@ -1854,6 +2084,38 @@ void VisionMidiEditor::paint (juce::Graphics& g)
         // Draw feed image stretched precisely into its pixel-matched bounding box
         g.drawImage (juceImage, videoBounds, juce::RectanglePlacement::stretchToFit);
 
+        // Object mode: ring the selected object, and show a path as it's being
+        // traced. Drawn here in the editor rather than composited into the
+        // frame on purpose — this is interface, not picture, and compositing it
+        // would feed the selection ring to the sequencer as if it were starlight.
+        if (audioProcessor.objectModeEnabled.load()) {
+            const int sel = audioProcessor.selectedObject.load();
+            float ox = 0.0f, oy = 0.0f, orad = 0.0f;
+            if (sel >= 0 && audioProcessor.objectViewPosition (sel, ox, oy, orad)) {
+                const float cx = videoBounds.getX() + ox * videoBounds.getWidth();
+                const float cy = videoBounds.getY() + oy * videoBounds.getHeight();
+                const float r  = juce::jmax (9.0f, orad * videoBounds.getWidth() * 1.6f);
+                g.setColour (juce::Colour (0xffec5e16).withAlpha (0.95f));
+                g.drawEllipse (cx - r, cy - r, r * 2.0f, r * 2.0f, 2.0f);
+                // Crosshair ticks: at small radii a bare circle on a starfield
+                // is easy to lose track of.
+                g.drawLine (cx - r - 5.0f, cy, cx - r + 2.0f, cy, 2.0f);
+                g.drawLine (cx + r - 2.0f, cy, cx + r + 5.0f, cy, 2.0f);
+                g.drawLine (cx, cy - r - 5.0f, cx, cy - r + 2.0f, 2.0f);
+                g.drawLine (cx, cy + r - 2.0f, cx, cy + r + 5.0f, 2.0f);
+            }
+            if (isDrawingPath && drawnPath.size() > 1) {
+                juce::Path p;
+                p.startNewSubPath (videoBounds.getX() + drawnPath[0].x * videoBounds.getWidth(),
+                                   videoBounds.getY() + drawnPath[0].y * videoBounds.getHeight());
+                for (size_t i = 1; i < drawnPath.size(); ++i)
+                    p.lineTo (videoBounds.getX() + drawnPath[i].x * videoBounds.getWidth(),
+                              videoBounds.getY() + drawnPath[i].y * videoBounds.getHeight());
+                g.setColour (juce::Colour (0xffffb040).withAlpha (0.9f));
+                g.strokePath (p, juce::PathStrokeType (2.0f));
+            }
+        }
+
         // Render sliding piano roll
         drawPianoRoll (g, pianoRollBounds);
 
@@ -2003,6 +2265,24 @@ void VisionMidiEditor::resized() {
 
     autoThresholdToggle.setBounds (leftX, y, controlW, 20); y += 24;
     invaderModeToggle.setBounds (leftX, y, controlW, 20); y += 24;
+
+    // Object mode, and its inspector. Everything below is laid out only when
+    // visible, so the panel collapses back to a single toggle when the mode is
+    // off or nothing is selected.
+    objectModeToggle.setBounds (leftX, y, controlW, 20); y += 24;
+    if (objectPathShapeSelector.isVisible()) {
+        objectPathShapeSelector.setBounds (leftX + 14, y, controlW - 14, 22); y += 25;
+        objectPathSpeedSlider.setBounds (leftX + 14, y, controlW - 14, 20); y += 24;
+    }
+    if (objectBlinkRateSlider.isVisible()) {
+        objectBlinkRateSlider.setBounds (leftX + 14, y, controlW - 14, 20); y += 24;
+    }
+    if (objectTintButton.isVisible()) {
+        const int half = (controlW - 14 - 6) / 2;
+        objectTintButton.setBounds (leftX + 14, y, half, 22);
+        objectResetButton.setBounds (leftX + 14 + half + 6, y, half, 22);
+        y += 26;
+    }
 
     // Indented under Invader mode to read as its sub-option, and costing no
     // vertical space at all while it's hidden.

@@ -288,6 +288,86 @@ public:
     // worth of history regardless of how long that sweep currently is.
     std::atomic<double> sequenceLoopBeats { 16.0 };
 
+    // ================= Object mode =====================================
+    // Contour-detected objects lifted out of the picture and played with:
+    // thrown, bounced off each other, looped along a path, blinked, tinted.
+    //
+    // The pixels MOVE. Each object is composited into the source frame before
+    // the zoom crop, which means `gray` (what the sequencer samples) and
+    // rgbFrame (what you see) both inherit it from one code path, and zoom,
+    // pan and rotation keep working with no extra mapping. Throw a star to the
+    // top of the frame and the sequencer plays it high; blink it and its note
+    // comes and goes. That coupling is the whole point of the mode - an object
+    // that moved without changing the music would just be decoration.
+    enum class ObjectMotion   { Fixed, Free, Path };
+    enum class ObjectPathShape { Drawn, Circle, Ellipse, Figure8 };
+
+    struct SceneObject {
+        cv::Mat sprite;              // BGR pixels lifted from the source frame
+        cv::Mat mask;                // 8U coverage from the contour, edge-feathered
+        cv::Point2f home { 0, 0 };   // normalised source centre it came from
+        cv::Point2f pos  { 0, 0 };   // normalised centre right now
+        cv::Point2f vel  { 0, 0 };   // normalised units per tick
+        float radius = 0.02f;        // normalised collision disc
+        float mass   = 1.0f;         // proportional to area, so big blobs shove small ones
+        bool  blink  = false;
+        float blinkHz = 2.0f;
+        double blinkPhase = 0.0;
+        bool  visible = true;
+        bool  tinted = false;
+        cv::Scalar tint { 1.0, 1.0, 1.0 };
+        ObjectMotion motion = ObjectMotion::Fixed;
+        ObjectPathShape pathShape = ObjectPathShape::Drawn;
+        std::vector<cv::Point2f> path;   // normalised, closed loop
+        float pathT = 0.0f;              // 0..1 around the path
+        float pathSpeed = 1.0f;          // loops per ~4 seconds at 1.0
+        bool  everMoved = false;         // once true the home spot stays erased
+    };
+
+    std::atomic<bool> objectModeEnabled { false };
+    // Set from the editor, consumed on run()'s thread - detection touches the
+    // frame and must not happen on the message thread.
+    std::atomic<bool> objectDetectPending { false };
+    std::atomic<int>  selectedObject { -1 };
+    // Collisions and bounces play a note. No longer exposed as a toggle - the
+    // mode is pointless silent, and it was the first thing anyone would want
+    // left on anyway.
+    std::atomic<bool> objectCollisionNotes { true };
+
+    int  objectCount() const;
+    // All of these take the objectLock themselves - safe from the message thread.
+    int  objectAtViewPoint (float viewX, float viewY) const;
+    void throwObject (int index, float velX, float velY);
+    void setObjectMotion (int index, ObjectMotion m);
+    void setObjectPathShape (int index, ObjectPathShape shape);
+    void setObjectDrawnPath (int index, const std::vector<cv::Point2f>& pathNormalised);
+    void setObjectPathSpeed (int index, float speed);
+    void setObjectBlink (int index, bool on, float hz);
+    // Cmd+click toggles blink, so the editor needs to flip it without knowing
+    // the current state, and to read back what an object is doing in order to
+    // show only the controls that apply to it.
+    void toggleObjectBlink (int index);
+    struct ObjectState {
+        bool valid = false;
+        bool blink = false;
+        float blinkHz = 2.0f;
+        bool tinted = false;
+        ObjectMotion motion = ObjectMotion::Fixed;
+        ObjectPathShape pathShape = ObjectPathShape::Drawn;
+        float pathSpeed = 1.0f;
+    };
+    ObjectState objectState (int index) const;
+    void setObjectTint (int index, bool on, float r, float g, float b);
+    // Both take points in VIEW space (0..1 across the video rectangle on
+    // screen) and map them back through zoom/pan/rotation themselves, so the
+    // editor never has to know the transform.
+    void placeObjectAtView (int index, float viewX, float viewY);
+    void setObjectDrawnPathFromView (int index, const std::vector<cv::Point2f>& viewPath);
+    void resetObject (int index);
+    void clearObjects();
+    // Normalised centre of an object, for drawing selection UI in the editor.
+    bool objectViewPosition (int index, float& viewX, float& viewY, float& viewRadius) const;
+
 private:
     void run() override;
 
@@ -363,6 +443,53 @@ private:
     // captured that tick — same reasoning as the meter decay below: the ship should
     // keep drifting smoothly even through a stalled/missing frame, not
     // freeze. No-ops immediately when invaderModeEnabled is false.
+    // --- Object mode internals (run() thread unless noted) ---------------
+    // Re-detects from scratch: contours above the detection threshold become
+    // objects, largest first and capped, so a noisy frame can't produce
+    // thousands of them.
+    // Detects ONLY within the rectangle currently on screen, not across the
+    // whole source frame. Zoomed in, the brightest 48 objects in the full
+    // picture can easily all be outside the view, which is what made visible
+    // stars unselectable; and an area floor measured against the whole frame
+    // rejects a star that looks large on screen. Both go away by working in
+    // the view's own rectangle, which is also why the view moving has to
+    // trigger a re-detect.
+    void detectObjects (const cv::Mat& sourceBgr);
+    // Shared tail of both detectors: turns a full-resolution binary region
+    // mask into a SceneObject (sprite, feathered mask, centre, radius, mass).
+    bool makeObjectFromMask (const cv::Mat& sourceBgr, const cv::Mat& regionMask,
+                             double area, SceneObject& out) const;
+    void updateObjectPhysics();
+    // Composites every object into `sourceBgr` IN PLACE: erases the home
+    // patch of anything that has moved or is hidden, then draws each visible
+    // sprite at its live position. Called before the zoom crop, so one pass
+    // serves both the sequencer and the display.
+    void compositeObjects (cv::Mat& sourceBgr);
+    // Median of a ring just outside the object, used to fill the hole it
+    // leaves behind - a plain black fill reads as a rectangle punched out of
+    // a nebula, where the local background reads as sky.
+    cv::Scalar backgroundAround (const cv::Mat& sourceBgr, cv::Point centre, int radius) const;
+    cv::Point2f pathPoint (const SceneObject& o, float t) const;
+    // Undoes the view rotation and zoom crop: a point on screen becomes a
+    // point in the source image, which is the space objects live in.
+    cv::Point2f viewToSource (float viewX, float viewY) const;
+    void objectCollisionNote (const SceneObject& a, float impactSpeed);
+
+    std::vector<SceneObject> sceneObjects;
+    // Guards sceneObjects and selectedObject against the editor's clicks and
+    // property changes landing mid-composite on run()'s thread.
+    mutable juce::CriticalSection objectLock;
+    // The view transform run() last used, so the editor can map a click in
+    // the video rectangle back to a source-normalised point. Written on
+    // run()'s thread, read on the message thread, under its own lock.
+    ViewTransform lastViewTransform;
+    mutable juce::CriticalSection viewTransformLock;
+    int ticksSinceObjectNote = 0;
+    // The view objects were last detected for, so run() can notice the user
+    // panning or zooming and re-detect against what is now on screen.
+    ViewTransform lastDetectView;
+    bool haveDetectedOnce = false;
+
     void updateShipPhysics();
 
     // Simulates bullets/collisions against `gray` and draws the ship,

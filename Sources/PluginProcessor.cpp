@@ -1825,6 +1825,543 @@ void VisionMidiProcessor::streamCaptureLoop() {
     streamCaptureThreadFinished.store (true);
 }
 
+// ============================ Object mode ===============================
+
+int VisionMidiProcessor::objectCount() const {
+    const juce::ScopedLock sl (objectLock);
+    return (int) sceneObjects.size();
+}
+
+void VisionMidiProcessor::clearObjects() {
+    const juce::ScopedLock sl (objectLock);
+    sceneObjects.clear();
+    selectedObject.store (-1);
+}
+
+// Contours above the detection threshold become objects. Sorted largest-first
+// and capped: a noisy or badly-thresholded frame can otherwise yield thousands
+// of specks, and every one of them would cost a sprite copy per tick.
+// Contours above the detection threshold, found inside the rectangle that is
+// currently on screen. Sorted largest-first and capped: a noisy frame can
+// otherwise yield thousands of specks, and every one costs a sprite copy per
+// tick.
+void VisionMidiProcessor::detectObjects (const cv::Mat& sourceBgr) {
+    if (sourceBgr.empty()) return;
+
+    ViewTransform view;
+    { const juce::ScopedLock vl (viewTransformLock); view = lastViewTransform; }
+
+    // The visible rectangle in source pixels. Rotation is approximated by its
+    // crop (which is overscanned, so it covers at least what's shown) - a few
+    // objects just outside a rotated view's corners is a far smaller problem
+    // than detecting across the whole frame.
+    cv::Rect roi ((int) (view.cropX0 * sourceBgr.cols), (int) (view.cropY0 * sourceBgr.rows),
+                  (int) (view.cropW * sourceBgr.cols), (int) (view.cropH * sourceBgr.rows));
+    roi &= cv::Rect (0, 0, sourceBgr.cols, sourceBgr.rows);
+    if (roi.width < 8 || roi.height < 8) roi = cv::Rect (0, 0, sourceBgr.cols, sourceBgr.rows);
+
+    const cv::Mat visible = sourceBgr (roi);
+
+    cv::Mat gray;
+    if (visible.channels() == 3) cv::cvtColor (visible, gray, cv::COLOR_BGR2GRAY);
+    else if (visible.channels() == 4) cv::cvtColor (visible, gray, cv::COLOR_BGRA2GRAY);
+    else gray = visible;
+
+    cv::Mat binary;
+    cv::threshold (gray, binary, (double) detectionThreshold.load(), 255.0, cv::THRESH_BINARY);
+    // Close one-pixel gaps so a star with a dim halo comes out as one object
+    // rather than a core plus a ring of fragments.
+    cv::morphologyEx (binary, binary, cv::MORPH_CLOSE,
+                      cv::getStructuringElement (cv::MORPH_ELLIPSE, { 5, 5 }));
+
+    std::vector<std::vector<cv::Point>> contours;
+    cv::findContours (binary, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+
+    // Measured against the VISIBLE area, so "big enough to bother with" means
+    // big enough on screen. Against the whole frame, zooming in made every
+    // star fail this test even as it filled more and more of the display.
+    const double viewArea = (double) gray.cols * (double) gray.rows;
+    const double minArea = viewArea * 0.000004;
+    const double maxArea = viewArea * 0.25;
+
+    std::vector<std::pair<double, size_t>> ranked;
+    for (size_t i = 0; i < contours.size(); ++i) {
+        const double a = cv::contourArea (contours[i]);
+        if (a >= minArea && a <= maxArea) ranked.push_back ({ a, i });
+    }
+    std::sort (ranked.begin(), ranked.end(),
+               [] (const auto& l, const auto& r) { return l.first > r.first; });
+
+    constexpr size_t maxObjects = 48;
+    if (ranked.size() > maxObjects) ranked.resize (maxObjects);
+
+    const juce::ScopedLock sl (objectLock);
+
+    // Anything in play SURVIVES a re-detect. Panning or zooming re-runs
+    // detection against the new view, and clearing the list outright would
+    // silently kill every thrown, looping or blinking object mid-flight - the
+    // picture would keep moving under them while the music they were making
+    // stopped dead. Only the untouched candidates get replaced.
+    std::vector<SceneObject> kept;
+    int newSelected = -1;
+    const int previouslySelected = selectedObject.load();
+    for (size_t i = 0; i < sceneObjects.size(); ++i) {
+        // In play, or merely selected: losing the selection to a re-detect
+        // would make the inspector vanish the moment the view was nudged,
+        // which is easy to do while reaching for an object.
+        const bool worthKeeping = sceneObjects[i].everMoved || (int) i == previouslySelected;
+        if (! worthKeeping) continue;
+        if ((int) i == previouslySelected) newSelected = (int) kept.size();
+        kept.push_back (std::move (sceneObjects[i]));
+    }
+
+    sceneObjects = std::move (kept);
+    selectedObject.store (newSelected);
+
+    for (const auto& [area, idx] : ranked) {
+        if (sceneObjects.size() >= maxObjects) break;
+
+        // Masks and sprites live in FULL-SOURCE coordinates even though the
+        // contour was found in the cropped view, because that is the space
+        // objects are composited back into - offset the contour accordingly.
+        cv::Mat regionMask (sourceBgr.rows, sourceBgr.cols, CV_8UC1, cv::Scalar (0));
+        std::vector<std::vector<cv::Point>> shifted { contours[idx] };
+        for (auto& pt : shifted[0]) pt += roi.tl();
+        cv::drawContours (regionMask, shifted, 0, cv::Scalar (255), cv::FILLED);
+
+        SceneObject o;
+        if (! makeObjectFromMask (sourceBgr, regionMask, area, o)) continue;
+
+        // Detection runs on the RAW frame, before compositing, so an object
+        // that has been thrown is still sitting at its home position as far as
+        // the contour finder is concerned. Without this it would be detected
+        // again and the same star would exist twice - once flying, once back
+        // where it started.
+        bool duplicate = false;
+        for (const auto& k : sceneObjects) {
+            if (cv::norm (k.home - o.home) < std::max ((double) k.radius, 0.008)) { duplicate = true; break; }
+        }
+        if (duplicate) continue;
+
+        sceneObjects.push_back (std::move (o));
+    }
+
+    lastDetectView = view;
+    haveDetectedOnce = true;
+}
+
+// Lift the pixels under `regionMask` into a sprite with a feathered alpha, and
+// work out where it sits and how heavy it is.
+bool VisionMidiProcessor::makeObjectFromMask (const cv::Mat& src, const cv::Mat& regionMask,
+                                              double area, SceneObject& o) const {
+    cv::Rect box = cv::boundingRect (regionMask);
+    if (box.width < 3 || box.height < 3) return false;
+
+    constexpr int pad = 3;   // room for the feathered edge to fall off into
+    box.x = std::max (0, box.x - pad);
+    box.y = std::max (0, box.y - pad);
+    box.width  = std::min (src.cols - box.x, box.width  + pad * 2);
+    box.height = std::min (src.rows - box.y, box.height + pad * 2);
+    if (box.width < 3 || box.height < 3) return false;
+
+    o.sprite = src (box).clone();
+    cv::Mat m = regionMask (box).clone();
+    // Feathered, so a lifted object doesn't carry a hard cut-out edge with it
+    // when it moves onto a different background.
+    cv::GaussianBlur (m, m, { 5, 5 }, 0);
+    o.mask = m;
+
+    o.home = { (float) (box.x + box.width  * 0.5) / (float) src.cols,
+               (float) (box.y + box.height * 0.5) / (float) src.rows };
+    o.pos = o.home;
+    o.radius = (float) (std::sqrt (std::max (1.0, area) / juce::MathConstants<double>::pi)
+                        / std::max (src.cols, src.rows));
+    o.radius = juce::jlimit (0.002f, 0.25f, o.radius);
+    o.mass = juce::jmax (0.05f, (float) (area / ((double) src.cols * src.rows)) * 100.0f);
+    return true;
+}
+
+cv::Point2f VisionMidiProcessor::pathPoint (const SceneObject& o, float t) const {
+    t = t - std::floor (t);
+    if (o.pathShape == ObjectPathShape::Drawn) {
+        if (o.path.size() < 2) return o.pos;
+        const float f = t * (float) o.path.size();
+        const size_t i = (size_t) f % o.path.size();
+        const size_t j = (i + 1) % o.path.size();
+        const float frac = f - std::floor (f);
+        return o.path[i] * (1.0f - frac) + o.path[j] * frac;
+    }
+    // Parametric shapes orbit the point the object was last placed at, sized
+    // from its own radius so a big blob sweeps a correspondingly big loop.
+    const float a = t * juce::MathConstants<float>::twoPi;
+    const float rx = juce::jmax (0.08f, o.radius * 6.0f);
+    const float ry = (o.pathShape == ObjectPathShape::Circle) ? rx : rx * 0.55f;
+    if (o.pathShape == ObjectPathShape::Figure8)
+        return { o.home.x + rx * std::sin (a), o.home.y + ry * std::sin (a * 2.0f) };
+    return { o.home.x + rx * std::cos (a), o.home.y + ry * std::sin (a) };
+}
+
+void VisionMidiProcessor::objectCollisionNote (const SceneObject& o, float impactSpeed) {
+    if (! objectCollisionNotes.load()) return;
+    // Rate-limited the same way grazing is: a pile-up of balls would otherwise
+    // fire a dozen notes in one tick.
+    if (ticksSinceObjectNote < 2) return;
+    ticksSinceObjectNote = 0;
+    const auto velocity = (uint8_t) juce::jlimit (40, 120, (int) (impactSpeed * 2600.0f));
+    scheduleInvaderRun ({ invaderNoteForY (o.pos.y, 0) }, velocity, 0.25, 0.25);
+}
+
+void VisionMidiProcessor::updateObjectPhysics() {
+    // Bounce off what's ON SCREEN, not off the source frame's edges. Zoomed
+    // in, the view is a sub-rectangle of the source, and objects rebounding
+    // off a border somewhere out of sight would look broken - they'd sail off
+    // the visible edge and come back later from nowhere. At zoom 1 this is
+    // exactly [0,1] either way, so the unzoomed behaviour is unchanged.
+    float minX = 0.0f, minY = 0.0f, maxX = 1.0f, maxY = 1.0f;
+    {
+        const juce::ScopedLock vl (viewTransformLock);
+        if (lastViewTransform.cropW > 1e-6f && lastViewTransform.cropH > 1e-6f) {
+            minX = lastViewTransform.cropX0;
+            minY = lastViewTransform.cropY0;
+            maxX = lastViewTransform.cropX0 + lastViewTransform.cropW;
+            maxY = lastViewTransform.cropY0 + lastViewTransform.cropH;
+        }
+    }
+
+    const juce::ScopedLock sl (objectLock);
+    ++ticksSinceObjectNote;
+
+    for (auto& o : sceneObjects) {
+        if (o.blink) {
+            o.blinkPhase += (double) o.blinkHz * 0.03;   // run() ticks at ~30ms
+            o.visible = std::fmod (o.blinkPhase, 1.0) < 0.5;
+            o.everMoved = true;   // the home patch must stay erased while it blinks
+        } else {
+            o.visible = true;
+        }
+
+        if (o.motion == ObjectMotion::Path) {
+            o.pathT += o.pathSpeed * 0.0075f;            // ~4s a loop at speed 1
+            if (o.pathT > 1.0f) o.pathT -= 1.0f;
+            o.pos = pathPoint (o, o.pathT);
+            o.everMoved = true;
+        } else if (o.motion == ObjectMotion::Free) {
+            o.pos += o.vel;
+            o.vel *= 0.995f;                              // a little rolling friction
+            // Bounce off the frame edge. Restitution under 1 so a thrown
+            // object eventually settles instead of rattling forever.
+            constexpr float restitution = 0.86f;
+            if (o.pos.x - o.radius < minX)      { o.pos.x = minX + o.radius;  o.vel.x = std::abs (o.vel.x) * restitution; objectCollisionNote (o, std::abs (o.vel.x)); }
+            else if (o.pos.x + o.radius > maxX) { o.pos.x = maxX - o.radius;  o.vel.x = -std::abs (o.vel.x) * restitution; objectCollisionNote (o, std::abs (o.vel.x)); }
+            if (o.pos.y - o.radius < minY)      { o.pos.y = minY + o.radius;  o.vel.y = std::abs (o.vel.y) * restitution; objectCollisionNote (o, std::abs (o.vel.y)); }
+            else if (o.pos.y + o.radius > maxY) { o.pos.y = maxY - o.radius;  o.vel.y = -std::abs (o.vel.y) * restitution; objectCollisionNote (o, std::abs (o.vel.y)); }
+            if (std::abs (o.vel.x) > 1e-5f || std::abs (o.vel.y) > 1e-5f) o.everMoved = true;
+        }
+    }
+
+    // Ball-to-ball collisions, discs approximated from contour area. O(n^2)
+    // over at most 48 objects is ~1100 checks a tick - nothing next to the
+    // image work going on around it.
+    for (size_t i = 0; i < sceneObjects.size(); ++i) {
+        auto& a = sceneObjects[i];
+        if (a.motion != ObjectMotion::Free) continue;
+        for (size_t j = i + 1; j < sceneObjects.size(); ++j) {
+            auto& b = sceneObjects[j];
+            if (b.motion == ObjectMotion::Path) continue;
+
+            cv::Point2f d = b.pos - a.pos;
+            float dist = std::sqrt (d.x * d.x + d.y * d.y);
+            const float minDist = a.radius + b.radius;
+            if (dist >= minDist || dist < 1e-6f) continue;
+
+            const cv::Point2f n = d / dist;
+            // Push them apart first, or a deep overlap sticks: the pair would
+            // otherwise re-collide every tick and jitter in place.
+            const float overlap = (minDist - dist) * 0.5f;
+            a.pos -= n * overlap;
+            b.pos += n * overlap;
+
+            const cv::Point2f rel = b.vel - a.vel;
+            const float sep = rel.x * n.x + rel.y * n.y;
+            if (sep > 0.0f) continue;                    // already separating
+
+            constexpr float restitution = 0.9f;
+            const float impulse = -(1.0f + restitution) * sep / (1.0f / a.mass + 1.0f / b.mass);
+            a.vel -= n * (impulse / a.mass);
+            b.vel += n * (impulse / b.mass);
+            a.everMoved = b.everMoved = true;
+            objectCollisionNote (a, std::abs (sep));
+        }
+    }
+}
+
+cv::Scalar VisionMidiProcessor::backgroundAround (const cv::Mat& src, cv::Point centre, int radius) const {
+    // Sample a ring just outside the object and take the mean. Filling the
+    // hole with black would read as a rectangle cut out of a nebula; the local
+    // sky reads as sky.
+    const int r = juce::jlimit (2, 64, radius);
+    cv::Rect outer (centre.x - r * 2, centre.y - r * 2, r * 4, r * 4);
+    outer &= cv::Rect (0, 0, src.cols, src.rows);
+    if (outer.width < 4 || outer.height < 4) return cv::Scalar (0, 0, 0);
+
+    cv::Mat ring (outer.height, outer.width, CV_8UC1, cv::Scalar (255));
+    cv::Point local (centre.x - outer.x, centre.y - outer.y);
+    cv::circle (ring, local, (int) (r * 1.15), cv::Scalar (0), cv::FILLED);
+    return cv::mean (src (outer), ring);
+}
+
+void VisionMidiProcessor::compositeObjects (cv::Mat& src) {
+    if (src.empty() || src.channels() < 3) return;
+    const juce::ScopedLock sl (objectLock);
+
+    for (const auto& o : sceneObjects) {
+        if (! o.everMoved) continue;   // untouched objects cost nothing at all
+
+        // 1. Erase where it used to be.
+        const int hx = (int) (o.home.x * src.cols), hy = (int) (o.home.y * src.rows);
+        cv::Rect homeBox (hx - o.sprite.cols / 2, hy - o.sprite.rows / 2,
+                          o.sprite.cols, o.sprite.rows);
+        cv::Rect clippedHome = homeBox & cv::Rect (0, 0, src.cols, src.rows);
+        if (clippedHome.width > 0 && clippedHome.height > 0) {
+            const cv::Scalar bg = backgroundAround (src, { hx, hy },
+                                                    std::max (o.sprite.cols, o.sprite.rows) / 2);
+            cv::Mat sub = o.mask (cv::Rect (clippedHome.x - homeBox.x, clippedHome.y - homeBox.y,
+                                            clippedHome.width, clippedHome.height));
+            cv::Mat patch (clippedHome.height, clippedHome.width, src.type(), bg);
+            patch.copyTo (src (clippedHome), sub);
+        }
+
+        if (! o.visible) continue;
+
+        // 2. Draw it where it is now, alpha-blended through the feathered mask.
+        const int px = (int) (o.pos.x * src.cols), py = (int) (o.pos.y * src.rows);
+        cv::Rect dstBox (px - o.sprite.cols / 2, py - o.sprite.rows / 2,
+                         o.sprite.cols, o.sprite.rows);
+        cv::Rect clipped = dstBox & cv::Rect (0, 0, src.cols, src.rows);
+        if (clipped.width <= 0 || clipped.height <= 0) continue;
+
+        const cv::Rect srcRoi (clipped.x - dstBox.x, clipped.y - dstBox.y,
+                               clipped.width, clipped.height);
+        cv::Mat sprite = o.sprite (srcRoi);
+        cv::Mat alpha  = o.mask (srcRoi);
+        cv::Mat dst    = src (clipped);
+
+        if (o.tinted) {
+            cv::Mat tinted;
+            sprite.convertTo (tinted, sprite.type(), 1.0, 0.0);
+            std::vector<cv::Mat> ch;
+            cv::split (tinted, ch);
+            // BGR order: tint carries (b, g, r) multipliers.
+            for (int c = 0; c < 3 && c < (int) ch.size(); ++c)
+                ch[(size_t) c] *= o.tint[c];
+            cv::merge (ch, tinted);
+            sprite = tinted;
+        }
+
+        for (int y = 0; y < clipped.height; ++y) {
+            const uchar* a = alpha.ptr<uchar> (y);
+            const uchar* s = sprite.ptr<uchar> (y);
+            uchar* d = dst.ptr<uchar> (y);
+            const int ch = src.channels();
+            for (int x = 0; x < clipped.width; ++x) {
+                const int w = a[x];
+                if (w == 0) continue;
+                for (int c = 0; c < 3; ++c) {
+                    const int i = x * ch + c, si = x * sprite.channels() + c;
+                    d[i] = (uchar) ((s[si] * w + d[i] * (255 - w)) / 255);
+                }
+            }
+        }
+    }
+}
+
+// --- Called from the message thread (editor clicks and property changes) ---
+
+cv::Point2f VisionMidiProcessor::viewToSource (float viewX, float viewY) const {
+    ViewTransform view;
+    { const juce::ScopedLock vl (viewTransformLock); view = lastViewTransform; }
+
+    // Same inverse the damage mask uses: undo the view rotation about the
+    // centre, then map through the zoom crop back into source-normalised space.
+    float dx = viewX - 0.5f, dy = viewY - 0.5f;
+    if (std::abs (view.rotationDegrees) > 0.01f) {
+        const float rad = view.rotationDegrees * juce::MathConstants<float>::pi / 180.0f;
+        const float c = std::cos (rad), s = std::sin (rad);
+        const float rx = c * dx - s * dy, ry = s * dx + c * dy;
+        dx = rx; dy = ry;
+    }
+    return { view.cropX0 + (dx + 0.5f) * view.cropW,
+             view.cropY0 + (dy + 0.5f) * view.cropH };
+}
+
+void VisionMidiProcessor::placeObjectAtView (int index, float viewX, float viewY) {
+    const cv::Point2f p = viewToSource (viewX, viewY);
+    const juce::ScopedLock sl (objectLock);
+    if (index < 0 || index >= (int) sceneObjects.size()) return;
+    auto& o = sceneObjects[(size_t) index];
+    o.pos = p;
+    o.vel = { 0, 0 };          // held in the hand, not flying
+    o.everMoved = true;
+}
+
+void VisionMidiProcessor::setObjectDrawnPathFromView (int index, const std::vector<cv::Point2f>& viewPath) {
+    std::vector<cv::Point2f> sourcePath;
+    sourcePath.reserve (viewPath.size());
+    for (const auto& v : viewPath) sourcePath.push_back (viewToSource (v.x, v.y));
+    setObjectDrawnPath (index, sourcePath);
+}
+
+int VisionMidiProcessor::objectAtViewPoint (float viewX, float viewY) const {
+    const cv::Point2f p = viewToSource (viewX, viewY);
+
+    // The grab radius has to be a constant distance ON SCREEN, so it scales
+    // with the crop: a flat 0.02 of the source was a fifth of the view at 10x
+    // zoom and only a couple of pixels when zoomed out. Stars are often just a
+    // few pixels across, and demanding a pixel-perfect hit makes this unusable.
+    float viewScale = 1.0f;
+    { const juce::ScopedLock vl (viewTransformLock);
+      viewScale = juce::jmax (0.01f, juce::jmax (lastViewTransform.cropW, lastViewTransform.cropH)); }
+    const float grab = 0.025f * viewScale;
+
+    const juce::ScopedLock sl (objectLock);
+    int best = -1;
+    float bestDist = std::numeric_limits<float>::max();
+    for (size_t i = 0; i < sceneObjects.size(); ++i) {
+        const auto& o = sceneObjects[i];
+        const float d = (float) cv::norm (o.pos - p);
+        if (d < std::max (o.radius * 1.8f, grab) && d < bestDist) { bestDist = d; best = (int) i; }
+    }
+    return best;
+}
+
+bool VisionMidiProcessor::objectViewPosition (int index, float& viewX, float& viewY, float& viewRadius) const {
+    ViewTransform view;
+    { const juce::ScopedLock vl (viewTransformLock); view = lastViewTransform; }
+    const juce::ScopedLock sl (objectLock);
+    if (index < 0 || index >= (int) sceneObjects.size()) return false;
+    const auto& o = sceneObjects[(size_t) index];
+
+    if (view.cropW < 1e-6f || view.cropH < 1e-6f) return false;
+    float dx = (o.pos.x - view.cropX0) / view.cropW - 0.5f;
+    float dy = (o.pos.y - view.cropY0) / view.cropH - 0.5f;
+    if (std::abs (view.rotationDegrees) > 0.01f) {
+        const float rad = -view.rotationDegrees * juce::MathConstants<float>::pi / 180.0f;
+        const float c = std::cos (rad), s = std::sin (rad);
+        const float rx = c * dx - s * dy, ry = s * dx + c * dy;
+        dx = rx; dy = ry;
+    }
+    viewX = dx + 0.5f;
+    viewY = dy + 0.5f;
+    viewRadius = o.radius / juce::jmax (view.cropW, view.cropH);
+    return true;
+}
+
+void VisionMidiProcessor::throwObject (int index, float velX, float velY) {
+    const juce::ScopedLock sl (objectLock);
+    if (index < 0 || index >= (int) sceneObjects.size()) return;
+    auto& o = sceneObjects[(size_t) index];
+    o.motion = ObjectMotion::Free;
+    o.vel = { velX, velY };
+    o.everMoved = true;
+}
+
+void VisionMidiProcessor::setObjectMotion (int index, ObjectMotion m) {
+    const juce::ScopedLock sl (objectLock);
+    if (index < 0 || index >= (int) sceneObjects.size()) return;
+    auto& o = sceneObjects[(size_t) index];
+    o.motion = m;
+    if (m == ObjectMotion::Fixed) o.vel = { 0, 0 };
+    // A parametric loop orbits wherever the object currently sits, so take
+    // that as the new centre rather than snapping back to where it was found.
+    if (m == ObjectMotion::Path && o.pathShape != ObjectPathShape::Drawn) o.home = o.pos;
+    if (m != ObjectMotion::Fixed) o.everMoved = true;
+}
+
+void VisionMidiProcessor::setObjectPathShape (int index, ObjectPathShape shape) {
+    const juce::ScopedLock sl (objectLock);
+    if (index < 0 || index >= (int) sceneObjects.size()) return;
+    auto& o = sceneObjects[(size_t) index];
+    o.pathShape = shape;
+    if (shape != ObjectPathShape::Drawn) o.home = o.pos;
+}
+
+void VisionMidiProcessor::setObjectDrawnPath (int index, const std::vector<cv::Point2f>& path) {
+    const juce::ScopedLock sl (objectLock);
+    if (index < 0 || index >= (int) sceneObjects.size()) return;
+    if (path.size() < 2) return;
+    auto& o = sceneObjects[(size_t) index];
+    o.path = path;
+    o.pathShape = ObjectPathShape::Drawn;
+    o.motion = ObjectMotion::Path;
+    o.pathT = 0.0f;
+    o.everMoved = true;
+}
+
+void VisionMidiProcessor::setObjectPathSpeed (int index, float speed) {
+    const juce::ScopedLock sl (objectLock);
+    if (index < 0 || index >= (int) sceneObjects.size()) return;
+    sceneObjects[(size_t) index].pathSpeed = juce::jlimit (0.05f, 8.0f, speed);
+}
+
+void VisionMidiProcessor::setObjectBlink (int index, bool on, float hz) {
+    const juce::ScopedLock sl (objectLock);
+    if (index < 0 || index >= (int) sceneObjects.size()) return;
+    auto& o = sceneObjects[(size_t) index];
+    o.blink = on;
+    o.blinkHz = juce::jlimit (0.1f, 20.0f, hz);
+    if (! on) o.visible = true;
+    else o.everMoved = true;
+}
+
+void VisionMidiProcessor::toggleObjectBlink (int index) {
+    const juce::ScopedLock sl (objectLock);
+    if (index < 0 || index >= (int) sceneObjects.size()) return;
+    auto& o = sceneObjects[(size_t) index];
+    o.blink = ! o.blink;
+    if (! o.blink) o.visible = true;
+    else o.everMoved = true;
+}
+
+VisionMidiProcessor::ObjectState VisionMidiProcessor::objectState (int index) const {
+    ObjectState st;
+    const juce::ScopedLock sl (objectLock);
+    if (index < 0 || index >= (int) sceneObjects.size()) return st;
+    const auto& o = sceneObjects[(size_t) index];
+    st.valid = true;
+    st.blink = o.blink;
+    st.blinkHz = o.blinkHz;
+    st.tinted = o.tinted;
+    st.motion = o.motion;
+    st.pathShape = o.pathShape;
+    st.pathSpeed = o.pathSpeed;
+    return st;
+}
+
+void VisionMidiProcessor::setObjectTint (int index, bool on, float r, float g, float b) {
+    const juce::ScopedLock sl (objectLock);
+    if (index < 0 || index >= (int) sceneObjects.size()) return;
+    auto& o = sceneObjects[(size_t) index];
+    o.tinted = on;
+    o.tint = cv::Scalar ((double) b, (double) g, (double) r);   // source is BGR
+    if (on) o.everMoved = true;
+}
+
+void VisionMidiProcessor::resetObject (int index) {
+    const juce::ScopedLock sl (objectLock);
+    if (index < 0 || index >= (int) sceneObjects.size()) return;
+    auto& o = sceneObjects[(size_t) index];
+    o.pos = o.home;
+    o.vel = { 0, 0 };
+    o.motion = ObjectMotion::Fixed;
+    o.blink = false;
+    o.tinted = false;
+    o.visible = true;
+    o.path.clear();
+    // Deliberately NOT clearing everMoved: the home patch has already been
+    // erased and refilled with background in previous frames, and the sprite
+    // is the only copy of those pixels left.
+}
+
 std::vector<int> VisionMidiProcessor::getScaleNotes (MusicalMode mode, int rootNote, int numNotes) {
     std::vector<int> intervals;
     switch (mode) {
@@ -2285,6 +2822,48 @@ void VisionMidiProcessor::run() {
         // contiguous Mat from it either way. Sequencer/detection sample
         // this cropped view, and it's exactly what's displayed too, so
         // what triggers a note is always what's actually on screen.
+        // Object mode composites BEFORE the zoom crop, in source space. That
+        // single pass then feeds everything downstream: viewFrame, the `gray`
+        // the sequencer samples, and the rgbFrame on screen all inherit it, so
+        // a thrown star is heard in its new position as well as seen there,
+        // and zoom/pan/rotate keep working without the mode knowing about them.
+        if (objectModeEnabled.load() && frameCaptured && ! frame.empty()) {
+            // frame can alias staticImageFrame (a loaded still) or a decoder's
+            // own buffer; compositing into it directly would permanently eat
+            // the stored source, exactly as the .clone() below guards against
+            // for gray. One clone per tick, only while the mode is on.
+            frame = frame.clone();
+
+            // Re-detect whenever what's on screen changes, because detection
+            // is scoped to the view: on the first frame after the mode is
+            // enabled, and then any time the view is panned, zoomed or
+            // rotated. Without this, zooming in would leave the old objects
+            // behind - anchored to a rectangle that is no longer displayed -
+            // which is exactly how visible stars ended up unselectable.
+            {
+                ViewTransform v;
+                { const juce::ScopedLock vl (viewTransformLock); v = lastViewTransform; }
+                constexpr float eps = 0.0008f;
+                const bool viewMoved = std::abs (v.cropX0 - lastDetectView.cropX0) > eps
+                                    || std::abs (v.cropY0 - lastDetectView.cropY0) > eps
+                                    || std::abs (v.cropW  - lastDetectView.cropW)  > eps
+                                    || std::abs (v.cropH  - lastDetectView.cropH)  > eps
+                                    || std::abs (v.rotationDegrees - lastDetectView.rotationDegrees) > 0.05f;
+                if (! haveDetectedOnce || viewMoved)
+                    objectDetectPending.store (true);
+            }
+
+            if (objectDetectPending.exchange (false))
+                detectObjects (frame);
+            updateObjectPhysics();
+            compositeObjects (frame);
+        } else {
+            // Mode is off: drop any pending request rather than letting it fire
+            // later, and arm a fresh detect for the next time it's enabled.
+            objectDetectPending.store (false);
+            haveDetectedOnce = false;
+        }
+
         cv::Mat viewFrame = frame;
         ViewTransform view;   // identity until the zoom/rotate path below fills it in
         if (frameCaptured && frame.cols > 0 && frame.rows > 0) {
@@ -2375,6 +2954,12 @@ void VisionMidiProcessor::run() {
         // unconditionally and just skips pixel sampling on an empty Mat, so
         // the sequencer's timeline can never be blocked by a video source
         // failing to deliver frames, however it fails to.
+        // Publish the transform the editor needs to turn a click in the video
+        // rectangle back into a source-normalised point (objectAtViewPoint).
+        // Taken here, after the zoom/rotate block above has finished filling
+        // `view` in, so it always describes the frame actually on screen.
+        { const juce::ScopedLock vl (viewTransformLock); lastViewTransform = view; }
+
         cv::Mat gray;
         if (frameCaptured) {
             if (viewFrame.channels() == 3) cv::cvtColor (viewFrame, gray, cv::COLOR_BGR2GRAY);

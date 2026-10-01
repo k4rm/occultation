@@ -44,24 +44,6 @@ directly. Open Terminal and run:
 
   xattr -d com.apple.quarantine ~/Downloads/Occultation-1.0.0.pkg
 
-
-AFTER INSTALLING
-
-Occultation is a MIDI EFFECT, not an instrument. In your host you need
-to wire up BOTH MIDI in and MIDI out, and route its MIDI output to an
-instrument. The plugin also generates its own audio, so you will hear
-it directly as well.
-
-If your host doesn't list it immediately, rescan your plugins. Logic
-and Live cache their plugin lists.
-
-To hear something straight away, open the Source menu and pick one of
-the bundled astrophotographs (M 8, M 17, M 20, M 33, IC 1848,
-NGC 281). Press Play and the sequencer starts reading the image.
-
-Camera sources will ask for camera permission the first time.
-
-
 SOURCE AND SUPPORT
 
   https://apokrypsi.com/occultation
