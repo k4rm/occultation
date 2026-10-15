@@ -59,6 +59,15 @@ CelestialAsset moonPhaseAsset (int phaseIndex)
 // there's no reason to keep two decoders around: JUCE's has to be linked in
 // regardless, reads jpg/png/gif, and takes file access out of OpenCV's hands
 // entirely (which also side-steps non-ASCII path handling).
+// Folds a few values into one key, to tell whether a cached stage of the
+// image pipeline is still valid.
+static long long cacheKeyOf (std::initializer_list<long long> values)
+{
+    long long k = 1469598103934665603LL;
+    for (auto v : values) k = (k ^ v) * 1099511628211LL;
+    return k;
+}
+
 static cv::Mat juceImageToBgrMat (juce::Image img)
 {
     if (! img.isValid()) return {};
@@ -1655,6 +1664,68 @@ void VisionMidiProcessor::updateAndDrawInvaderMode (cv::Mat& rgbFrame, const cv:
     }
 }
 
+// "Mostly light": the median brightness of the picture is high, i.e. more
+// than half of it is light. 110, not something near white: paper photographed
+// under room light comes out mid-grey (~150), while a starfield's median sits
+// near black, so astro images are never flipped. Judged on a small copy, so
+// it costs nothing even for a large FITS stack.
+bool VisionMidiProcessor::isMostlyLight (const cv::Mat& image)
+{
+    if (image.empty()) return false;
+    cv::Mat small, gray;
+    const double scale = std::min (1.0, 256.0 / (double) std::max (image.cols, image.rows));
+    cv::resize (image, small, cv::Size(), scale, scale, cv::INTER_AREA);
+    if (small.channels() == 3) cv::cvtColor (small, gray, cv::COLOR_BGR2GRAY);
+    else if (small.channels() == 4) cv::cvtColor (small, gray, cv::COLOR_BGRA2GRAY);
+    else gray = small;
+
+    int histogram[256] = {};
+    for (int y = 0; y < gray.rows; ++y) {
+        const uchar* row = gray.ptr<uchar> (y);
+        for (int x = 0; x < gray.cols; ++x) ++histogram[row[x]];
+    }
+    const int half = gray.rows * gray.cols / 2;
+    int seen = 0, median = 0;
+    for (; median < 256; ++median) { seen += histogram[median]; if (seen > half) break; }
+    return median >= 110;
+}
+
+// On a light background the objects are whatever differs from the paper:
+// dark (a black elastic), coloured (a purple pick) or neither darker nor
+// lighter at all (a light-blue pen, whose grey is the paper's). So instead of
+// brightness, each pixel's distance from the paper's colour around it — the
+// largest of its three channel differences — becomes the "brightness" the
+// sequencer, the threshold and the display all work from.
+//
+// The paper's colour is estimated locally, from a 64-pixel copy of the image
+// median-blurred well beyond the size of any object, so a photo's uneven
+// light (darker corners, a gradient across the page) counts as paper rather
+// than as an object. Doubled, so a black mark on white saturates and the
+// auto-threshold sits comfortably above paper texture and soft shadows.
+cv::Mat VisionMidiProcessor::lightBackgroundSaliency (const cv::Mat& image)
+{
+    cv::Mat bgr;
+    if (image.channels() == 3) bgr = image;
+    else if (image.channels() == 4) cv::cvtColor (image, bgr, cv::COLOR_BGRA2BGR);
+    else cv::cvtColor (image, bgr, cv::COLOR_GRAY2BGR);
+
+    const double scale = 64.0 / (double) std::max (bgr.cols, bgr.rows);
+    cv::Mat small, smallBackground, background;
+    cv::resize (bgr, small, cv::Size(), scale, scale, cv::INTER_AREA);
+    cv::medianBlur (small, smallBackground, 15);
+    cv::resize (smallBackground, background, bgr.size(), 0, 0, cv::INTER_LINEAR);
+
+    cv::Mat difference;
+    cv::absdiff (bgr, background, difference);
+    cv::Mat channels[3];
+    cv::split (difference, channels);
+    cv::Mat largest = cv::max (cv::max (channels[0], channels[1]), channels[2]);
+
+    cv::Mat saliency;
+    largest.convertTo (saliency, CV_8U, 2.0);
+    return saliency;
+}
+
 void VisionMidiProcessor::switchSource (int sourceId) {
     // Stop any running stream thread BEFORE taking captureLock below — that
     // thread takes the same lock itself (briefly, between reads, to publish
@@ -1674,12 +1745,25 @@ void VisionMidiProcessor::switchSource (int sourceId) {
     lastStreamFrameTimeMs = 0;
     lastGoodFrame.release();
     staticImageFrame.release();
+    ++sourceGeneration;   // every cached stage of the old source is now stale
+    cachedSkyFrame.release();
+    cachedViewFrame.release();
+    cachedGray.release();
+    cachedBaseDisplay.release();
+    lastPublishedKey = 0;
+    otsuCacheData = nullptr;
+    lightBackground.store (false);
     // Every new source starts unzoomed and centred rather than carrying
     // over whatever rectangle a previous, differently-framed source had.
     viewZoom.store (1.0f);
     viewCenterX.store (0.5f);
     viewCenterY.store (0.5f);
     viewRotationDegrees.store (0.0f);
+
+    // The sky map zeroes the threshold (see below); an image arriving after it
+    // gets the default back rather than a threshold that crushes nothing.
+    if (sourceId != 997 && detectionThreshold.load() < 1.0f)
+        detectionThreshold.store (128.0f);
 
     const auto& samples = sampleImages();
     const int sampleIndex = sourceId - firstSampleImageSourceId;
@@ -1714,8 +1798,16 @@ void VisionMidiProcessor::switchSource (int sourceId) {
             juce::String ext = file.getFileExtension().toLowerCase();
             if (ext == ".jpg" || ext == ".jpeg" || ext == ".png") {
                 staticImageFrame = loadImageFileAsMat (file);
-                if (!staticImageFrame.empty()) { isStaticImage = true; activeSourceId = sourceId; }
+                if (!staticImageFrame.empty()) {
+                    isStaticImage = true;
+                    activeSourceId = sourceId;
+                    // Dark marks on a light page (a drawing, a chart, a
+                    // scan): detection is flipped so the marks play.
+                    lightBackground.store (isMostlyLight (staticImageFrame));
+                }
             } else if (ext == ".fits" || ext == ".fit" || ext == ".fts") {
+                // Never flipped: a FITS file is an astro stack, and a stretched
+                // one with a bright gradient can have a light median.
                 staticImageFrame = loadFitsAsMat (customPath);
                 if (!staticImageFrame.empty()) { isStaticImage = true; activeSourceId = sourceId; }
             } else if (customPath.contains ("://")) {
@@ -1866,16 +1958,8 @@ void VisionMidiProcessor::detectObjects (const cv::Mat& sourceBgr) {
     if (visible.channels() == 3) cv::cvtColor (visible, gray, cv::COLOR_BGR2GRAY);
     else if (visible.channels() == 4) cv::cvtColor (visible, gray, cv::COLOR_BGRA2GRAY);
     else gray = visible;
-
-    cv::Mat binary;
-    cv::threshold (gray, binary, (double) detectionThreshold.load(), 255.0, cv::THRESH_BINARY);
-    // Close one-pixel gaps so a star with a dim halo comes out as one object
-    // rather than a core plus a ring of fragments.
-    cv::morphologyEx (binary, binary, cv::MORPH_CLOSE,
-                      cv::getStructuringElement (cv::MORPH_ELLIPSE, { 5, 5 }));
-
-    std::vector<std::vector<cv::Point>> contours;
-    cv::findContours (binary, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+    // Light background: the objects are what stands out from the paper.
+    if (lightBackground.load()) gray = lightBackgroundSaliency (visible);
 
     // Measured against the VISIBLE area, so "big enough to bother with" means
     // big enough on screen. Against the whole frame, zooming in made every
@@ -1884,10 +1968,36 @@ void VisionMidiProcessor::detectObjects (const cv::Mat& sourceBgr) {
     const double minArea = viewArea * 0.000004;
     const double maxArea = viewArea * 0.25;
 
+    std::vector<std::vector<cv::Point>> contours;
     std::vector<std::pair<double, size_t>> ranked;
-    for (size_t i = 0; i < contours.size(); ++i) {
-        const double a = cv::contourArea (contours[i]);
-        if (a >= minArea && a <= maxArea) ranked.push_back ({ a, i });
+    auto findAt = [&] (double thresh) {
+        cv::Mat binary;
+        cv::threshold (gray, binary, thresh, 255.0, cv::THRESH_BINARY);
+        // Close one-pixel gaps so a star with a dim halo comes out as one
+        // object rather than a core plus a ring of fragments.
+        cv::morphologyEx (binary, binary, cv::MORPH_CLOSE,
+                          cv::getStructuringElement (cv::MORPH_ELLIPSE, { 5, 5 }));
+        contours.clear();
+        ranked.clear();
+        cv::findContours (binary, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+        for (size_t i = 0; i < contours.size(); ++i) {
+            const double a = cv::contourArea (contours[i]);
+            if (a >= minArea && a <= maxArea) ranked.push_back ({ a, i });
+        }
+    };
+    // The threshold the picture is crushed with, unless it finds nothing: the
+    // auto threshold only moves while the transport runs, so a stopped host
+    // can leave it anywhere (at 0 after the sky map, where the whole frame is
+    // one blob too big to be an object). Then the image's own threshold, the
+    // one Auto Thresh would settle on, picks the objects instead.
+    // The sky map's threshold is 0 on purpose (nothing crushed on screen),
+    // so it never gets the first try.
+    const float setThreshold = detectionThreshold.load();
+    if (setThreshold >= 1.0f) findAt ((double) setThreshold);
+    if (ranked.empty()) {
+        cv::Mat otsuDst;
+        const double otsu = cv::threshold (gray, otsuDst, 0, 255, cv::THRESH_BINARY | cv::THRESH_OTSU);
+        findAt (juce::jlimit (20.0, 250.0, otsu * 0.7 + cv::mean (gray)[0] * 0.5 + 25.0));
     }
     std::sort (ranked.begin(), ranked.end(),
                [] (const auto& l, const auto& r) { return l.first > r.first; });
@@ -2415,10 +2525,20 @@ std::vector<int> VisionMidiProcessor::getScaleNotes (MusicalMode mode, int rootN
 
 float VisionMidiProcessor::computeSmoothedAutoThreshold (const cv::Mat& grayFrame) {
     static float smoothedAutoThresh = 128.0f;
-    cv::Mat otsuDst;
-    double otsuThresh = cv::threshold (grayFrame, otsuDst, 0, 255, cv::THRESH_BINARY | cv::THRESH_OTSU);
-    cv::Scalar meanScalar = cv::mean (grayFrame);
-    float instantThresh = (float)(otsuThresh * 0.7 + meanScalar[0] * 0.5 + 25.0);
+    // The same grey as last tick (a still image, cached by run()): its Otsu
+    // threshold and mean can't have changed, so they aren't recomputed —
+    // only the smoothing below keeps easing towards them.
+    float instantThresh = otsuCacheInstant;
+    if (grayFrame.data != otsuCacheData || grayFrame.rows != otsuCacheRows || grayFrame.cols != otsuCacheCols) {
+        cv::Mat otsuDst;
+        double otsuThresh = cv::threshold (grayFrame, otsuDst, 0, 255, cv::THRESH_BINARY | cv::THRESH_OTSU);
+        cv::Scalar meanScalar = cv::mean (grayFrame);
+        instantThresh = (float)(otsuThresh * 0.7 + meanScalar[0] * 0.5 + 25.0);
+        otsuCacheData = grayFrame.data;
+        otsuCacheRows = grayFrame.rows;
+        otsuCacheCols = grayFrame.cols;
+        otsuCacheInstant = instantThresh;
+    }
     smoothedAutoThresh = smoothedAutoThresh * 0.95f + instantThresh * 0.05f;
     return juce::jlimit (20.0f, 250.0f, smoothedAutoThresh);
 }
@@ -2678,9 +2798,23 @@ void VisionMidiProcessor::processSequenceMode (const cv::Mat& gray, bool isHostP
 
         int maxIntensity = 0;
         float rowHeight = (float)gray.rows / 24.0f;
+        // On a light background the objects can be thin (a pen lying flat, a
+        // drawn line) and fall between two rows' centre lines; there, each row
+        // takes the strongest pixel across its whole band instead. A starfield
+        // keeps sampling the centre line, as it always has.
+        const bool sampleBands = lightBackground.load();
 
         for (int i = 0; i < 24; ++i) {
             int midY = (int)((i + 0.5f) * rowHeight);
+            if (sampleBands && cursorX >= 0 && cursorX < gray.cols) {
+                const int y0 = juce::jlimit (0, gray.rows - 1, (int) (i * rowHeight));
+                const int y1 = juce::jlimit (y0 + 1, gray.rows, (int) ((i + 1) * rowHeight));
+                int best = -1;
+                for (int y = y0; y < y1; ++y) {
+                    const int v = (int) gray.at<uchar> (y, cursorX);
+                    if (v > best) { best = v; midY = y; }
+                }
+            }
             if (cursorX >= 0 && cursorX < gray.cols && midY >= 0 && midY < gray.rows) {
                 int intensity = (int)gray.at<uchar>(midY, cursorX);
                 if ((float)intensity > activeThresh && intensity > maxIntensity) {
@@ -2717,6 +2851,45 @@ void VisionMidiProcessor::processSequenceMode (const cv::Mat& gray, bool isHostP
     }
 }
 
+void VisionMidiProcessor::publishDisplay (const cv::Mat& rgbFrame)
+{
+    const juce::ScopedLock sl (imageLock);
+    // Reused while the size stays the same, rather than a fresh allocation
+    // (and on macOS a fresh CoreGraphics image) every frame.
+    if (! juceImage.isValid() || juceImage.getWidth() != rgbFrame.cols || juceImage.getHeight() != rgbFrame.rows)
+        juceImage = juce::Image (juce::Image::RGB, rgbFrame.cols, rgbFrame.rows, true);
+    juce::Image::BitmapData data (juceImage, juce::Image::BitmapData::readWrite);
+
+    // Native image formats (e.g. CoreGraphics on macOS) may store pixels as
+    // 4-byte ARGB even when Image::RGB is requested, so a flat 3-bytes-per-pixel
+    // memcpy of each row silently truncates the right edge of every frame. Check
+    // the stride once and use OpenCV's vectorized conversion + a per-row memcpy
+    // instead of a manual scalar loop over every pixel (the previous approach
+    // burned a full CPU core at typical camera/FITS resolutions).
+    //
+    // JUCE's PixelARGB (the 4-byte case) is NOT byte-order R,G,B,A on a
+    // little-endian desktop build — juce_PixelFormats.h's non-Android,
+    // non-big-endian branch sets indexB=0, indexG=1, indexR=2, indexA=3, i.e.
+    // the real in-memory order is B,G,R,A. (PixelRGB, the 3-byte case below,
+    // really is R,G,B on JUCE_MAC, so that branch is unaffected.) Converting
+    // with COLOR_RGB2RGBA and memcpy'ing that straight in swapped red and blue
+    // on every pixel with red != blue — invisible on the mostly-grey video/star
+    // feed, but glaring on any saturated colour, which is exactly why the
+    // Occulting Object photos (a yellow Sun rendering as light blue, i.e.
+    // Uranus's actual colour with red and blue swapped) exposed it.
+    // COLOR_RGB2BGRA produces the B,G,R,A byte order this format actually needs.
+    if (data.pixelStride == 4) {
+        cv::Mat rgbaFrame;
+        cv::cvtColor (rgbFrame, rgbaFrame, cv::COLOR_RGB2BGRA);
+        for (int y = 0; y < rgbaFrame.rows; ++y)
+            std::memcpy (data.getLinePointer (y), rgbaFrame.ptr (y), (size_t) rgbaFrame.cols * 4);
+    } else {
+        for (int y = 0; y < rgbFrame.rows; ++y)
+            std::memcpy (data.getLinePointer (y), rgbFrame.ptr (y), (size_t) rgbFrame.cols * 3);
+    }
+    displayFrameVersion.fetch_add (1);
+}
+
 void VisionMidiProcessor::run() {
     cv::Mat frame;
     while (!threadShouldExit() && isRunning) {
@@ -2746,41 +2919,55 @@ void VisionMidiProcessor::run() {
         {
             const juce::ScopedLock sl (captureLock);
             if (activeSourceId == 997) {
-                // Sky map mode: render a sky map frame at the current RA/Dec/zoom.
-                //
-                // Rotation is applied HERE rather than being left to the
-                // generic warp further down, because the sky is procedural:
-                // we can just render a bigger piece of it and rotate that,
-                // so every corner lands on real stars. The generic path can
-                // only ever rotate the pixels it was given, which left the
-                // swung-past corners black — visible as black wedges down
-                // the sides once zoomed in and rotated. Rendering the
-                // overscan costs nothing but a slightly larger draw, and the
-                // result is cropped straight back to the normal frame size
-                // so nothing downstream sees a rotation-dependent size.
-                float rotationNow = viewRotationDegrees.load();
-                if (std::abs (rotationNow) > 0.01f) {
-                    float rad = rotationNow * juce::MathConstants<float>::pi / 180.0f;
-                    float c = std::abs (std::cos (rad)), s = std::abs (std::sin (rad));
-                    int bigW = (int) std::ceil (skyMapFrameWidth * c + skyMapFrameHeight * s);
-                    int bigH = (int) std::ceil (skyMapFrameWidth * s + skyMapFrameHeight * c);
-
-                    cv::Mat big = skyMapRenderer.renderFrame (skyMapRaDegrees.load(), skyMapDecDegrees.load(),
-                                                              skyMapZoomDegPerPixel.load(),
-                                                              bigW, bigH, rotationNow);
-                    if (! big.empty()) {
-                        cv::Point2f bigCentre ((float) big.cols / 2.0f, (float) big.rows / 2.0f);
-                        cv::Mat rot = cv::getRotationMatrix2D (bigCentre, (double) rotationNow, 1.0);
-                        rot.at<double> (0, 2) += (double) skyMapFrameWidth / 2.0 - (double) bigCentre.x;
-                        rot.at<double> (1, 2) += (double) skyMapFrameHeight / 2.0 - (double) bigCentre.y;
-                        cv::warpAffine (big, frame, rot, cv::Size (skyMapFrameWidth, skyMapFrameHeight),
-                                        cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar (0, 0, 0, 0));
-                    }
+                // The sky only changes when the view does: re-render it only
+                // when the position, zoom, rotation or size has moved.
+                const long long skyKey = cacheKeyOf ({ (long long) sourceGeneration,
+                                                       (long long) std::llround (skyMapRaDegrees.load() * 1.0e4),
+                                                       (long long) std::llround (skyMapDecDegrees.load() * 1.0e4),
+                                                       (long long) std::llround (skyMapZoomDegPerPixel.load() * 1.0e7),
+                                                       (long long) std::llround (viewRotationDegrees.load() * 100.0),
+                                                       (long long) skyMapFrameWidth, (long long) skyMapFrameHeight });
+                if (skyKey == cachedSkyKey && ! cachedSkyFrame.empty()) {
+                    frame = cachedSkyFrame;
                 } else {
-                    frame = skyMapRenderer.renderFrame (skyMapRaDegrees.load(), skyMapDecDegrees.load(),
-                                                        skyMapZoomDegPerPixel.load(),
-                                                        skyMapFrameWidth, skyMapFrameHeight,
-                                                        rotationNow);
+                    // Sky map mode: render a sky map frame at the current RA/Dec/zoom.
+                    //
+                    // Rotation is applied HERE rather than being left to the
+                    // generic warp further down, because the sky is procedural:
+                    // we can just render a bigger piece of it and rotate that,
+                    // so every corner lands on real stars. The generic path can
+                    // only ever rotate the pixels it was given, which left the
+                    // swung-past corners black — visible as black wedges down
+                    // the sides once zoomed in and rotated. Rendering the
+                    // overscan costs nothing but a slightly larger draw, and the
+                    // result is cropped straight back to the normal frame size
+                    // so nothing downstream sees a rotation-dependent size.
+                    float rotationNow = viewRotationDegrees.load();
+                    if (std::abs (rotationNow) > 0.01f) {
+                        float rad = rotationNow * juce::MathConstants<float>::pi / 180.0f;
+                        float c = std::abs (std::cos (rad)), s = std::abs (std::sin (rad));
+                        int bigW = (int) std::ceil (skyMapFrameWidth * c + skyMapFrameHeight * s);
+                        int bigH = (int) std::ceil (skyMapFrameWidth * s + skyMapFrameHeight * c);
+
+                        cv::Mat big = skyMapRenderer.renderFrame (skyMapRaDegrees.load(), skyMapDecDegrees.load(),
+                                                                  skyMapZoomDegPerPixel.load(),
+                                                                  bigW, bigH, rotationNow);
+                        if (! big.empty()) {
+                            cv::Point2f bigCentre ((float) big.cols / 2.0f, (float) big.rows / 2.0f);
+                            cv::Mat rot = cv::getRotationMatrix2D (bigCentre, (double) rotationNow, 1.0);
+                            rot.at<double> (0, 2) += (double) skyMapFrameWidth / 2.0 - (double) bigCentre.x;
+                            rot.at<double> (1, 2) += (double) skyMapFrameHeight / 2.0 - (double) bigCentre.y;
+                            cv::warpAffine (big, frame, rot, cv::Size (skyMapFrameWidth, skyMapFrameHeight),
+                                            cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar (0, 0, 0, 0));
+                        }
+                    } else {
+                        frame = skyMapRenderer.renderFrame (skyMapRaDegrees.load(), skyMapDecDegrees.load(),
+                                                            skyMapZoomDegPerPixel.load(),
+                                                            skyMapFrameWidth, skyMapFrameHeight,
+                                                            rotationNow);
+                    }
+                    cachedSkyFrame = frame;
+                    cachedSkyKey = skyKey;
                 }
                 if (!frame.empty()) frameCaptured = true;
             } else if (isStaticImage) {
@@ -2866,7 +3053,28 @@ void VisionMidiProcessor::run() {
 
         cv::Mat viewFrame = frame;
         ViewTransform view;   // identity until the zoom/rotate path below fills it in
-        if (frameCaptured && frame.cols > 0 && frame.rows > 0) {
+
+        // A still image or the sky map, with nothing compositing into or
+        // damaging it per tick: the view and its grey are a pure function of
+        // the frame and the view settings, so they're reused while those stay
+        // put rather than re-cropped, re-rotated and re-converted every tick.
+        const bool cacheable = frameCaptured && (isStaticImage || activeSourceId == 997)
+                            && ! objectModeEnabled.load() && ! invaderModeEnabled.load();
+        const bool invertDetection = lightBackground.load();
+        const long long viewKey = cacheKeyOf ({ (long long) sourceGeneration, (long long) activeSourceId,
+                                                (long long) (intptr_t) frame.data, (long long) frame.cols, (long long) frame.rows,
+                                                (long long) std::llround (viewZoom.load() * 1.0e4),
+                                                (long long) std::llround (viewCenterX.load() * 1.0e5),
+                                                (long long) std::llround (viewCenterY.load() * 1.0e5),
+                                                (long long) std::llround (viewRotationDegrees.load() * 100.0),
+                                                invertDetection ? 1LL : 0LL });
+        const bool viewCached = cacheable && viewKey == cachedViewKey && ! cachedGray.empty();
+        if (viewCached) {
+            viewFrame = cachedViewFrame;
+            view = cachedViewTransform;
+        }
+
+        if (! viewCached && frameCaptured && frame.cols > 0 && frame.rows > 0) {
             float zoom = viewZoom.load();
             float rotation = viewRotationDegrees.load();
             bool zooming = zoom > 1.0001f;
@@ -2961,7 +3169,9 @@ void VisionMidiProcessor::run() {
         { const juce::ScopedLock vl (viewTransformLock); lastViewTransform = view; }
 
         cv::Mat gray;
-        if (frameCaptured) {
+        if (viewCached) {
+            gray = cachedGray;
+        } else if (frameCaptured) {
             if (viewFrame.channels() == 3) cv::cvtColor (viewFrame, gray, cv::COLOR_BGR2GRAY);
             else if (viewFrame.channels() == 4) cv::cvtColor (viewFrame, gray, cv::COLOR_BGRA2GRAY);
             // .clone(), not an alias: a single-channel source (a mono FITS
@@ -2971,6 +3181,19 @@ void VisionMidiProcessor::run() {
             // stored source image and in what's displayed, not just in what
             // the sequencer samples.
             else gray = viewFrame.clone();
+
+            // A light background: everything downstream (the sequencer, the
+            // threshold, auto-threshold, Invader collisions) looks for BRIGHT
+            // pixels, so what it's given instead of grey is how much each
+            // pixel stands out from the paper (lightBackgroundSaliency).
+            if (invertDetection) gray = lightBackgroundSaliency (viewFrame);
+
+            if (cacheable) {
+                cachedViewFrame = viewFrame;
+                cachedGray = gray;
+                cachedViewTransform = view;
+                cachedViewKey = viewKey;
+            }
         }
 
         // Destructive play: whatever's been shot is subtracted from `gray`
@@ -3030,127 +3253,176 @@ void VisionMidiProcessor::run() {
                 emberCircleThickness = 6;
             }
 
-            cv::Mat rgbFrame;
-            if (viewFrame.channels() == 3) cv::cvtColor (viewFrame, rgbFrame, cv::COLOR_BGR2RGB);
-            else if (viewFrame.channels() == 4) cv::cvtColor (viewFrame, rgbFrame, cv::COLOR_BGRA2RGB);
-            else cv::cvtColor (viewFrame, rgbFrame, cv::COLOR_GRAY2RGB);
+            if (! invaderModeEnabled.load()) {
+                // --- The display, in two stages: a base picture (the view,
+                // threshold-crushed, already at display size) that's only
+                // rebuilt when the view, the threshold or the source changes,
+                // and the overlays (sequencer cursor, occulting object) drawn
+                // onto a copy of it at display size. A still image therefore
+                // costs nothing while stopped and a few small draws while
+                // playing, instead of a full-resolution convert, crush,
+                // upscale and downscale every 30 ms.
+                const float zoomNow = juce::jmax (1.0f, viewZoom.load());
+                const double canvasScale = zoomNow > 1.0001f ? (double) zoomNow : 1.0;   // the old overlay canvas
+                constexpr int maxDisplayDim = 960;
+                const int longestView = std::max (viewFrame.cols, viewFrame.rows);
+                const double displayScale = (double) longestView * canvasScale > maxDisplayDim
+                                                ? (double) maxDisplayDim / (double) longestView
+                                                : canvasScale;
+                const int threshNow = (int) std::lround (detectionThreshold.load());
+                const long long baseKey = cacheKeyOf ({ viewKey, (long long) threshNow, (long long) std::llround (displayScale * 1.0e6),
+                                                        invertDetection ? 1LL : 0LL });
+                if (! cacheable || baseKey != cachedBaseDisplayKey || cachedBaseDisplay.empty()) {
+                    cv::Mat rgb;
+                    if (viewFrame.channels() == 3) cv::cvtColor (viewFrame, rgb, cv::COLOR_BGR2RGB);
+                    else if (viewFrame.channels() == 4) cv::cvtColor (viewFrame, rgb, cv::COLOR_BGRA2RGB);
+                    else cv::cvtColor (viewFrame, rgb, cv::COLOR_GRAY2RGB);
 
-            // Pixels below the detection threshold are crushed to black so the feed
-            // shows exactly what the detector currently treats as "dark".
-            float displayThresh = detectionThreshold.load();
-            cv::Mat belowThreshMask;
-            cv::threshold (gray, belowThreshMask, (double) displayThresh, 255.0, cv::THRESH_BINARY_INV);
-            rgbFrame.setTo (cv::Scalar (0, 0, 0), belowThreshMask);
+                    // What the detector ignores is crushed: to black on a dark
+                    // sky, to white on a light background (where the grey was
+                    // inverted, so the same mask picks out the background).
+                    cv::Mat ignoredMask;
+                    cv::threshold (gray, ignoredMask, (double) threshNow, 255.0, cv::THRESH_BINARY_INV);
+                    rgb.setTo (invertDetection ? cv::Scalar (255, 255, 255) : cv::Scalar (0, 0, 0), ignoredMask);
 
-            // viewFrame (and so rgbFrame, still the same size here) shrinks as
-            // viewZoom grows — see the crop that built viewFrame, far above.
-            // Sequence sampling above needed that actual shrunk
-            // frame (so a magnitude/threshold reading always matches what's
-            // on screen), but drawing overlays into a canvas that's already
-            // been crushed down to a fraction of its native resolution is
-            // what made the Occulting Object (and the sequence cursor line)
-            // pixelate at high zoom, however good the resize used to render
-            // them. Undoing exactly that shrink now, right before overlays
-            // go on — a real digital-zoom upscale, not a stretch — restores
-            // a full native-resolution canvas to draw them into, so they get
-            // the same pixel budget at any zoom level. (The image content
-            // itself was already fully sampled at the shrunk resolution, so
-            // this can only make it as sharp as it was pre-crop, not sharper.)
-            float zoom = juce::jmax (1.0f, viewZoom.load());
-            int cursorXNow = sequenceCursorX.load();
-            // A local copy to draw at, scaled into the upscaled frame's
-            // coordinate space below — persistentStarPos itself must stay in
-            // viewFrame's original (unscaled) space, since it's a member
-            // that's read again next frame; scaling it in place here would
-            // compound every frame zoom is active, drifting the overlay off
-            // its note position more with every tick.
-            cv::Point drawStarPos = persistentStarPos;
-            if (zoom > 1.0001f) {
-                cv::Mat upscaledFrame;
-                cv::resize (rgbFrame, upscaledFrame, cv::Size(), (double) zoom, (double) zoom, cv::INTER_LINEAR);
-                rgbFrame = upscaledFrame;
-                if (cursorXNow >= 0) cursorXNow = (int) ((float) cursorXNow * zoom);
-                if (drawStarPos.x >= 0) {
-                    drawStarPos.x = (int) ((float) drawStarPos.x * zoom);
-                    drawStarPos.y = (int) ((float) drawStarPos.y * zoom);
+                    if (std::abs (displayScale - 1.0) > 1.0e-6) {
+                        cv::Mat scaled;
+                        cv::resize (rgb, scaled, cv::Size(), displayScale, displayScale,
+                                    displayScale > 1.0 ? cv::INTER_LINEAR : cv::INTER_AREA);
+                        rgb = scaled;
+                    }
+                    cachedBaseDisplay = rgb;
+                    cachedBaseDisplayKey = baseKey;
                 }
-            }
 
-            // Overlay markers are drawn AFTER the crush, directly in RGB, so they
-            // stay fully visible regardless of Thresh instead of being crushed
-            // away like any other dark-background pixel.
-            if (cursorXNow >= 0)
-                cv::line (rgbFrame, cv::Point (cursorXNow, 0), cv::Point (cursorXNow, rgbFrame.rows),
-                          cv::Scalar (226, 80, 10), (int) juce::jmax (2.0f, 2.0f * zoom), cv::LINE_AA);
-
-            if (drawEmberCircle) {
-                // The Moon's phase is one fixed position of the cycle per
-                // sequencer loop step, rather than the discrete note-
-                // triggered step counter or a continuously-drifting time
-                // fraction — loopStepIndex is which beat of the loop is
-                // currently playing (constant for that whole beat), spread
-                // evenly across the 8 real phase photos over one full loop.
-                int loopStepCount = juce::jmax (1, (int) sequenceLoopBeats.load());
-                int loopStepIndex = (int) std::floor (std::fmod (continuousPpq.load(), (double) loopStepCount));
-                drawOccultingObject (rgbFrame, occultingObject.load(), drawStarPos,
-                                     emberCircleRadius, emberCircleColourRGB, emberCircleThickness,
-                                     occultingObjectStep.load(), loopStepIndex, loopStepCount);
-            }
-
-            // Ship/bullets/explosions — no-ops immediately unless Invader
-            // mode is on. Drawn into the same already zoom-upscaled canvas
-            // as the overlays above, and collides against `gray` (the
-            // shrunk, pre-upscale view) exactly like the sequencer's own
-            // star sampling does, so a hit always matches what's on screen.
-            updateAndDrawInvaderMode (rgbFrame, gray, view);
-
-            // The editor only ever shows this stretched into a small preview panel
-            // (see VisionMidiEditor::paint), so building and re-copying it into a
-            // CoreGraphics image at full capture resolution (e.g. 1920x1080 from a
-            // FITS stack) every ~30ms burns CPU for detail nobody can see on screen.
-            // Downscale once here, after overlay drawing, so both this copy and the
-            // per-repaint CGImage rebuild on the UI thread work on far fewer pixels.
-            constexpr int maxDisplayDim = 960;
-            int longestEdge = std::max (rgbFrame.cols, rgbFrame.rows);
-            if (longestEdge > maxDisplayDim) {
-                double scale = (double) maxDisplayDim / (double) longestEdge;
-                cv::Mat scaledFrame;
-                cv::resize (rgbFrame, scaledFrame, cv::Size(), scale, scale, cv::INTER_AREA);
-                rgbFrame = scaledFrame;
-            }
-
-            {
-                const juce::ScopedLock sl (imageLock);
-                juceImage = juce::Image (juce::Image::RGB, rgbFrame.cols, rgbFrame.rows, true);
-                juce::Image::BitmapData data (juceImage, juce::Image::BitmapData::readWrite);
-
-                // Native image formats (e.g. CoreGraphics on macOS) may store pixels as
-                // 4-byte ARGB even when Image::RGB is requested, so a flat 3-bytes-per-pixel
-                // memcpy of each row silently truncates the right edge of every frame. Check
-                // the stride once and use OpenCV's vectorized conversion + a per-row memcpy
-                // instead of a manual scalar loop over every pixel (the previous approach
-                // burned a full CPU core at typical camera/FITS resolutions).
-                //
-                // JUCE's PixelARGB (the 4-byte case) is NOT byte-order R,G,B,A on a
-                // little-endian desktop build — juce_PixelFormats.h's non-Android,
-                // non-big-endian branch sets indexB=0, indexG=1, indexR=2, indexA=3, i.e.
-                // the real in-memory order is B,G,R,A. (PixelRGB, the 3-byte case below,
-                // really is R,G,B on JUCE_MAC, so that branch is unaffected.) Converting
-                // with COLOR_RGB2RGBA and memcpy'ing that straight in swapped red and blue
-                // on every pixel with red != blue — invisible on the mostly-grey video/star
-                // feed, but glaring on any saturated colour, which is exactly why the
-                // Occulting Object photos (a yellow Sun rendering as light blue, i.e.
-                // Uranus's actual colour with red and blue swapped) exposed it.
-                // COLOR_RGB2BGRA produces the B,G,R,A byte order this format actually needs.
-                if (data.pixelStride == 4) {
-                    cv::Mat rgbaFrame;
-                    cv::cvtColor (rgbFrame, rgbaFrame, cv::COLOR_RGB2BGRA);
-                    for (int y = 0; y < rgbaFrame.rows; ++y)
-                        std::memcpy (data.getLinePointer (y), rgbaFrame.ptr (y), (size_t) rgbaFrame.cols * 4);
-                } else {
-                    for (int y = 0; y < rgbFrame.rows; ++y)
-                        std::memcpy (data.getLinePointer (y), rgbFrame.ptr (y), (size_t) rgbFrame.cols * 3);
+                // Overlays, scaled from the old full-size canvas to the
+                // display: same look, drawn on far fewer pixels.
+                const double overlayScale = displayScale / canvasScale;
+                const int cursorXNow = sequenceCursorX.load();
+                const int loopStepCount = juce::jmax (1, (int) sequenceLoopBeats.load());
+                const int loopStepIndex = (int) std::floor (std::fmod (continuousPpq.load(), (double) loopStepCount));
+                const long long publishKey = cacheKeyOf ({ baseKey, (long long) cursorXNow,
+                                                           drawEmberCircle ? 1LL : 0LL,
+                                                           drawEmberCircle ? (long long) persistentStarPos.x : 0LL,
+                                                           drawEmberCircle ? (long long) persistentStarPos.y : 0LL,
+                                                           drawEmberCircle ? (long long) emberCircleRadius : 0LL,
+                                                           drawEmberCircle ? (long long) rainbowHueCounter : 0LL,
+                                                           drawEmberCircle ? (long long) occultingObject.load() : 0LL,
+                                                           drawEmberCircle ? (long long) occultingObjectStep.load() : 0LL,
+                                                           drawEmberCircle ? (long long) loopStepIndex : 0LL,
+                                                           (long long) cachedBaseDisplay.cols, (long long) cachedBaseDisplay.rows });
+                // Nothing on screen would change (stopped on a still image,
+                // say): don't rebuild or republish the picture at all.
+                if (publishKey != lastPublishedKey || ! cacheable) {
+                    lastPublishedKey = publishKey;
+                    cv::Mat canvas = cachedBaseDisplay.clone();
+                    if (cursorXNow >= 0) {
+                        const int x = (int) ((double) cursorXNow * displayScale);
+                        const int thickness = juce::jmax (1, (int) std::lround (juce::jmax (2.0f, 2.0f * zoomNow) * overlayScale));
+                        cv::line (canvas, cv::Point (x, 0), cv::Point (x, canvas.rows), cv::Scalar (226, 80, 10), thickness, cv::LINE_AA);
+                    }
+                    if (drawEmberCircle) {
+                        const cv::Point at ((int) ((double) persistentStarPos.x * displayScale),
+                                            (int) ((double) persistentStarPos.y * displayScale));
+                        drawOccultingObject (canvas, occultingObject.load(), at,
+                                             juce::jmax (2, (int) std::lround (emberCircleRadius * overlayScale)),
+                                             emberCircleColourRGB,
+                                             juce::jmax (1, (int) std::lround (emberCircleThickness * overlayScale)),
+                                             occultingObjectStep.load(), loopStepIndex, loopStepCount);
+                    }
+                    publishDisplay (canvas);
                 }
+            } else {
+                cv::Mat rgbFrame;
+                if (viewFrame.channels() == 3) cv::cvtColor (viewFrame, rgbFrame, cv::COLOR_BGR2RGB);
+                else if (viewFrame.channels() == 4) cv::cvtColor (viewFrame, rgbFrame, cv::COLOR_BGRA2RGB);
+                else cv::cvtColor (viewFrame, rgbFrame, cv::COLOR_GRAY2RGB);
+
+                // Pixels the detector ignores are crushed (to black, or to
+                // white on a light background) so the feed shows exactly what
+                // it currently treats as background.
+                float displayThresh = detectionThreshold.load();
+                cv::Mat belowThreshMask;
+                cv::threshold (gray, belowThreshMask, (double) displayThresh, 255.0, cv::THRESH_BINARY_INV);
+                rgbFrame.setTo (invertDetection ? cv::Scalar (255, 255, 255) : cv::Scalar (0, 0, 0), belowThreshMask);
+
+                // viewFrame (and so rgbFrame, still the same size here) shrinks as
+                // viewZoom grows — see the crop that built viewFrame, far above.
+                // Sequence sampling above needed that actual shrunk
+                // frame (so a magnitude/threshold reading always matches what's
+                // on screen), but drawing overlays into a canvas that's already
+                // been crushed down to a fraction of its native resolution is
+                // what made the Occulting Object (and the sequence cursor line)
+                // pixelate at high zoom, however good the resize used to render
+                // them. Undoing exactly that shrink now, right before overlays
+                // go on — a real digital-zoom upscale, not a stretch — restores
+                // a full native-resolution canvas to draw them into, so they get
+                // the same pixel budget at any zoom level. (The image content
+                // itself was already fully sampled at the shrunk resolution, so
+                // this can only make it as sharp as it was pre-crop, not sharper.)
+                float zoom = juce::jmax (1.0f, viewZoom.load());
+                int cursorXNow = sequenceCursorX.load();
+                // A local copy to draw at, scaled into the upscaled frame's
+                // coordinate space below — persistentStarPos itself must stay in
+                // viewFrame's original (unscaled) space, since it's a member
+                // that's read again next frame; scaling it in place here would
+                // compound every frame zoom is active, drifting the overlay off
+                // its note position more with every tick.
+                cv::Point drawStarPos = persistentStarPos;
+                if (zoom > 1.0001f) {
+                    cv::Mat upscaledFrame;
+                    cv::resize (rgbFrame, upscaledFrame, cv::Size(), (double) zoom, (double) zoom, cv::INTER_LINEAR);
+                    rgbFrame = upscaledFrame;
+                    if (cursorXNow >= 0) cursorXNow = (int) ((float) cursorXNow * zoom);
+                    if (drawStarPos.x >= 0) {
+                        drawStarPos.x = (int) ((float) drawStarPos.x * zoom);
+                        drawStarPos.y = (int) ((float) drawStarPos.y * zoom);
+                    }
+                }
+
+                // Overlay markers are drawn AFTER the crush, directly in RGB, so they
+                // stay fully visible regardless of Thresh instead of being crushed
+                // away like any other dark-background pixel.
+                if (cursorXNow >= 0)
+                    cv::line (rgbFrame, cv::Point (cursorXNow, 0), cv::Point (cursorXNow, rgbFrame.rows),
+                              cv::Scalar (226, 80, 10), (int) juce::jmax (2.0f, 2.0f * zoom), cv::LINE_AA);
+
+                if (drawEmberCircle) {
+                    // The Moon's phase is one fixed position of the cycle per
+                    // sequencer loop step, rather than the discrete note-
+                    // triggered step counter or a continuously-drifting time
+                    // fraction — loopStepIndex is which beat of the loop is
+                    // currently playing (constant for that whole beat), spread
+                    // evenly across the 8 real phase photos over one full loop.
+                    int loopStepCount = juce::jmax (1, (int) sequenceLoopBeats.load());
+                    int loopStepIndex = (int) std::floor (std::fmod (continuousPpq.load(), (double) loopStepCount));
+                    drawOccultingObject (rgbFrame, occultingObject.load(), drawStarPos,
+                                         emberCircleRadius, emberCircleColourRGB, emberCircleThickness,
+                                         occultingObjectStep.load(), loopStepIndex, loopStepCount);
+                }
+
+                // Ship/bullets/explosions — no-ops immediately unless Invader
+                // mode is on. Drawn into the same already zoom-upscaled canvas
+                // as the overlays above, and collides against `gray` (the
+                // shrunk, pre-upscale view) exactly like the sequencer's own
+                // star sampling does, so a hit always matches what's on screen.
+                updateAndDrawInvaderMode (rgbFrame, gray, view);
+
+                // The editor only ever shows this stretched into a small preview panel
+                // (see VisionMidiEditor::paint), so building and re-copying it into a
+                // CoreGraphics image at full capture resolution (e.g. 1920x1080 from a
+                // FITS stack) every ~30ms burns CPU for detail nobody can see on screen.
+                // Downscale once here, after overlay drawing, so both this copy and the
+                // per-repaint CGImage rebuild on the UI thread work on far fewer pixels.
+                constexpr int maxDisplayDim = 960;
+                int longestEdge = std::max (rgbFrame.cols, rgbFrame.rows);
+                if (longestEdge > maxDisplayDim) {
+                    double scale = (double) maxDisplayDim / (double) longestEdge;
+                    cv::Mat scaledFrame;
+                    cv::resize (rgbFrame, scaledFrame, cv::Size(), scale, scale, cv::INTER_AREA);
+                    rgbFrame = scaledFrame;
+                }
+                publishDisplay (rgbFrame);
             }
         }
 

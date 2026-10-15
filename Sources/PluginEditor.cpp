@@ -1753,7 +1753,54 @@ void VisionMidiEditor::timerCallback() {
 
     updateSkyMapCoordinateDisplay();
 
-    repaint();
+    // --- Repaint only what changed ---
+    auto keyOf = [] (std::initializer_list<long long> values) {
+        long long k = 1469598103934665603LL;
+        for (auto v : values) k = (k ^ v) * 1099511628211LL;
+        return k;
+    };
+
+    // Overlays (a file being dragged in, the file browser, the stream prompt)
+    // dim the whole window: while one is up, keep repainting all of it.
+    const bool overlayUp = isDraggingValidFile
+                        || (fileBrowserOverlay != nullptr && fileBrowserOverlay->isVisible())
+                        || streamPromptLabel.isVisible();
+    if (overlayUp || lastVideoAreaBounds.isEmpty()) {
+        repaint();
+        return;
+    }
+
+    // The title's moon transit and colour cycle move every tick.
+    repaint (titleBounds);
+
+    // The video, its level meter and the piano roll: a new picture from the
+    // processor, a meter moving, the roll scrolling (it follows the
+    // transport, which stands still while stopped), or Object mode's
+    // selection ring and drawn path, which are drawn here, not in the picture.
+    int notes = 0;
+    {
+        const juce::ScopedLock sl (audioProcessor.pianoRollLock);
+        notes = (int) audioProcessor.pianoRollNotes.size();
+    }
+    const long long videoKey = keyOf ({ (long long) audioProcessor.displayFrameVersion.load(),
+                                        (long long) std::llround (audioProcessor.currentMidiLevel.load() * 200.0f),
+                                        (long long) std::llround (audioProcessor.midiPeakLevel.load() * 200.0f),
+                                        (long long) std::llround (audioProcessor.continuousPpq.load() * 200.0),
+                                        (long long) notes,
+                                        (long long) audioProcessor.currentRootNote.load(),
+                                        audioProcessor.objectModeEnabled.load() ? (long long) juce::Time::getMillisecondCounter() : 0LL });
+    if (videoKey != lastVideoAreaKey) {
+        lastVideoAreaKey = videoKey;
+        repaint (lastVideoAreaBounds.getSmallestIntegerContainer());
+    }
+
+    // The synth's output meter.
+    const long long audioKey = keyOf ({ (long long) std::llround (audioProcessor.currentAudioLevel.load() * 200.0f),
+                                        (long long) std::llround (audioProcessor.audioPeakLevel.load() * 200.0f) });
+    if (audioKey != lastAudioMeterKey && ! audioLevelMeterBounds.isEmpty()) {
+        lastAudioMeterKey = audioKey;
+        repaint (audioLevelMeterBounds.getSmallestIntegerContainer().expanded (2));
+    }
 }
 
 void VisionMidiEditor::drawLevelMeter (juce::Graphics& g, juce::Rectangle<float> bounds, float level, float peak)
@@ -1891,17 +1938,29 @@ void VisionMidiEditor::paint (juce::Graphics& g)
 {
     using namespace OccultPalette;
 
-    g.fillAll (voidBlack);
-
-    // A dying vignette — the light gutters out toward the corners
+    // The fill and a dying vignette (the light gutters out toward the
+    // corners), from a cache: the gradient covers the whole window, and is
+    // only redrawn when the window's size or the display's density changes.
     {
-        float cx = (float)getWidth() * 0.5f;
-        float cy = (float)getHeight() * 0.5f;
-        juce::ColourGradient vignette (juce::Colours::transparentBlack, cx, cy,
-                                        juce::Colours::black.withAlpha (0.75f), 0.0f, 0.0f, true);
-        vignette.addColour (0.65, juce::Colours::transparentBlack);
-        g.setGradientFill (vignette);
-        g.fillAll();
+        float density = 1.0f;
+        if (auto* d = juce::Desktop::getInstance().getDisplays().getDisplayForRect (getScreenBounds()))
+            density = (float) d->scale;
+        const int w = juce::jmax (1, juce::roundToInt ((float) getWidth() * density));
+        const int h = juce::jmax (1, juce::roundToInt ((float) getHeight() * density));
+        if (! backgroundCache.isValid() || backgroundCache.getWidth() != w || backgroundCache.getHeight() != h) {
+            backgroundCache = juce::Image (juce::Image::RGB, w, h, false);
+            juce::Graphics bg (backgroundCache);
+            bg.addTransform (juce::AffineTransform::scale (density));
+            bg.fillAll (voidBlack);
+            float cx = (float)getWidth() * 0.5f;
+            float cy = (float)getHeight() * 0.5f;
+            juce::ColourGradient vignette (juce::Colours::transparentBlack, cx, cy,
+                                            juce::Colours::black.withAlpha (0.75f), 0.0f, 0.0f, true);
+            vignette.addColour (0.65, juce::Colours::transparentBlack);
+            bg.setGradientFill (vignette);
+            bg.fillAll();
+        }
+        g.drawImage (backgroundCache, getLocalBounds().toFloat());
     }
 
     // Left Controls. Height stops above the synth panel at the bottom of
@@ -2078,6 +2137,7 @@ void VisionMidiEditor::paint (juce::Graphics& g)
                                                 videoW + meterGap + meterWidth, rollHeight);
 
         juce::Rectangle<float> combinedBounds = videoBounds.getUnion (pianoRollBounds);
+        lastVideoAreaBounds = combinedBounds.getUnion (meterBounds).expanded (2.0f);
         g.setColour (panelDeep);
         g.fillRoundedRectangle (combinedBounds, 4.0f);
 
@@ -2134,6 +2194,7 @@ void VisionMidiEditor::paint (juce::Graphics& g)
         g.setColour (ashGrey.withAlpha (0.5f));
         g.setFont (14.0f);
         g.drawText ("Awaiting the Feed...", mainArea, juce::Justification::centred, true);
+        lastVideoAreaBounds = mainArea.toFloat();
         zoomInButton.setVisible (false);
         zoomOutButton.setVisible (false);
         rotateButton.setVisible (false);

@@ -218,6 +218,16 @@ private:
     // have to.
     juce::Rectangle<float> lastVideoBounds;
 
+    // Repainting only what changed. The timer used to repaint the whole
+    // window 30 times a second, playing or not; now each tick repaints the
+    // title (whose moon and colours always move) and, only when something in
+    // them changed, the video area and the synth's output meter.
+    juce::Rectangle<float> lastVideoAreaBounds;   // video + level meter + piano roll, set in paint()
+    long long lastVideoAreaKey = 0, lastAudioMeterKey = 0;
+    // The window's fill and vignette (a full-window radial gradient), drawn
+    // once per size instead of on every repaint.
+    juce::Image backgroundCache;
+
     // Sky-map drag-to-pan state, captured at mouseDown and read for the
     // whole gesture so the drag is anchored to an absolute RA/Dec rather
     // than accumulated per-event (which could drift on rounding).

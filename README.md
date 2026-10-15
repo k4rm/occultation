@@ -1,6 +1,6 @@
 # Occultation
 
-![The Occultation plugin running in a host: a stacked astrophotography frame being swept by the sequencer, with the synth panel below](docs/screenshot.png)
+![The Occultation plugin : a stacked astrophotography frame being swept by the sequencer, with the synth panel below](docs/screenshot.png)
 
 Occultation is an audio plugin (VST3 + Standalone, macOS) that turns light into music. It watches an image source — from a camera, a local file, a network stream, or star chart — and converts brightness into music in real time.
 
@@ -61,6 +61,14 @@ Sky Map mode uses the same gestures for its own RA/Dec pan/zoom instead.
   Auto-threshold (Otsu's method, smoothed) is on by default; disable it to
   set a fixed threshold manually. Sky Map mode fixes this at 0, since it
   samples the star catalog directly rather than pixel brightness.
+  An opened .jpg/.png whose background is mostly light (a drawing, a chart,
+  a scan, a photo of things on a sheet of paper) is detected as such when it
+  loads, and the logic flips: whatever stands out from the paper triggers
+  notes, whether it's darker or just a different colour (a light-blue pen
+  counts, though its grey is the paper's). The paper's colour is judged
+  locally, so a photo's uneven lighting doesn't count as an object, and the
+  background is shown crushed to white rather than black. FITS stacks are
+  never flipped.
 - **Play/Stop** — stopping the transport (the host's, or this button in
   Standalone) silences the plugin completely: the synth engine is reset, which
   kills held voices, their envelopes, the reverb/delay tails and any invader SFX

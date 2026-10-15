@@ -277,6 +277,15 @@ public:
 
     juce::CriticalSection imageLock;
     juce::Image juceImage;
+    // Bumped every time juceImage holds a new picture, so the editor repaints
+    // the video only when there is something new to show.
+    std::atomic<int> displayFrameVersion { 0 };
+
+    // A loaded image whose background is mostly light (a drawing, a chart, a
+    // scan, a photo of things on paper): detection then looks for whatever
+    // stands out from the paper, dark or coloured, instead of for bright
+    // pixels, and the background is what's ignored. Decided once on loading.
+    std::atomic<bool> lightBackground { false };
 
     juce::CriticalSection pianoRollLock;
     std::vector<NoteEvent> pianoRollNotes;
@@ -771,6 +780,30 @@ private:
 
     cv::Point lastStarPos { -1, -1 };
     cv::Point persistentStarPos { -1, -1 };
+    // --- Skipping work whose inputs haven't changed (run()'s thread only) ---
+    // A still image, or the sky map at rest, produces the same picture every
+    // tick until something about it changes; re-deriving it 30 times a second
+    // (crop, grey, threshold crush and, above all, the downscale to display
+    // size, which OpenCV spreads over every core) was most of this plugin's
+    // CPU, playing or not. Each stage is cached under a key of its inputs.
+    int sourceGeneration = 0;             // bumped by every switchSource()
+    cv::Mat cachedSkyFrame;
+    long long cachedSkyKey = 0;
+    cv::Mat cachedViewFrame, cachedGray;  // the cropped/rotated view, and its grey
+    long long cachedViewKey = 0;
+    ViewTransform cachedViewTransform;
+    cv::Mat cachedBaseDisplay;            // threshold-crushed, at display size, before overlays
+    long long cachedBaseDisplayKey = 0;
+    long long lastPublishedKey = 0;       // base + overlays last copied into juceImage
+    const uchar* otsuCacheData = nullptr; // computeSmoothedAutoThreshold's last frame...
+    int otsuCacheRows = 0, otsuCacheCols = 0;
+    float otsuCacheInstant = 128.0f;      // ...and its Otsu-derived threshold
+    void publishDisplay (const cv::Mat& rgbFrame);
+    static bool isMostlyLight (const cv::Mat& image);
+    // On a light background, what the detector reads as "brightness": how far
+    // each pixel is from the paper's own colour around it. See the .cpp.
+    static cv::Mat lightBackgroundSaliency (const cv::Mat& image);
+
     int circleHoldFramesRemaining = 0;
     int rainbowHueCounter = 0;
     // Eased toward the velocity-derived target radius each frame rather
